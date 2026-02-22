@@ -176,6 +176,10 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
         "Return JSON only. No markdown. No prose.",
         f"Write final JSON to: {out_path}",
     ]
+
+    analyst_brief = settings.base_dir / "docs" / "context" / "analyst_market_spec_2026-02-22.txt"
+    if stage == "analyst" and analyst_brief.exists():
+        base.insert(1, f"Read additional strategic brief at: {analyst_brief}")
     if in_path:
         base.insert(1, f"Read previous stage output at: {in_path}")
 

@@ -45,6 +45,7 @@ Primary integration file: `bot/services/openclaw.py`
 
 - `run_openclaw_agents(...)`:
   - runs first 3 LLM subagents
+  - analyst stage also consumes optional strategic brief at `docs/context/analyst_market_spec_2026-02-22.txt` when present
   - marks `video_generator` as `bypassed_hitl`
   - sets `assembly_manager` to `waiting_human_input`
   - writes handoff payload and returns `waiting_human`
