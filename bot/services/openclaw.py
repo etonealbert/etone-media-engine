@@ -1,213 +1,307 @@
 """
-OpenClaw agent runner mock with Kling 3.0 API stubs.
-Simulates the multi-agent video production pipeline with status streaming.
+OpenClaw pipeline integration service.
 
-INTEGRATION NOTES (for connecting to real OpenClaw):
------------------------------------------------------
-This module contains a mock implementation that simulates the agent workflow.
-When the real OpenClaw system is ready, replace the asyncio.sleep() calls
-with actual API/CLI invocations. The JSON payload structure is documented
-in the comments to match the expected OpenClaw Gateway contract.
+This module runs the first 3 LLM stages through real OpenClaw agents
+(analyst -> scriptwriter -> prompt_engineer) and keeps tool stages as
+status-tracked placeholders unless external tool runners are attached.
 """
 
 import asyncio
 import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from aiogram import Bot
 from aiogram.types import Message
 
+from bot.config import settings
 from bot.services.file_manager import get_latest_video
 
+logger = logging.getLogger(__name__)
 
-async def run_openclaw_agents(
-    task_data: dict,
-    status_message: Message,
-    bot: Bot,
-) -> Path | None:
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _jobs_dir() -> Path:
+    d = settings.base_dir / "data" / "jobs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _extract_first_json_object(text: str) -> dict[str, Any]:
     """
-    Run the OpenClaw multi-agent video production pipeline.
-
-    This is currently a mock that simulates the workflow with status updates.
-    In production, this function would:
-    1. Construct a JSON payload from task_data
-    2. Submit it to the OpenClaw Gateway (CLI or API)
-    3. Poll for status updates
-    4. Download the resulting video
-
-    Args:
-        task_data: Dict containing avatar, location, product, task description,
-                   and target length selections.
-        status_message: The Telegram message to edit with status updates.
-        bot: The Bot instance for API calls.
-
-    Returns:
-        Path to the generated video file, or None if generation failed.
+    Extract first valid JSON object from model output.
+    Handles cases where model wraps JSON in prose/code fences.
     """
+    text = text.strip()
 
-    # =========================================================================
-    # STEP 1: Construct the OpenClaw JSON Payload
-    # =========================================================================
-    # When connecting to the real OpenClaw system, this payload would be sent
-    # to the OpenClaw Gateway via CLI (`openclaw run --config payload.json`)
-    # or via HTTP API (`POST /api/v1/jobs`).
-
-    target_length = task_data.get("target_length_seconds", 15)
-    needs_chaining = target_length > 15
-    num_segments = (target_length + 14) // 15  # ceil division
-
-    payload = {
-        # --- Asset References ---
-        "avatar": {
-            "folder": task_data.get("avatar_folder", ""),
-            "path": task_data.get("avatar_path", ""),
-            # The front_medium.png file is used as the primary face reference
-            # for Kling's Elements/Reference API to lock facial features
-        },
-        "location": {
-            "folder": task_data.get("location_folder", ""),
-            "path": task_data.get("location_path", ""),
-        },
-        "product": {
-            "folder": task_data.get("product_folder", ""),
-            "path": task_data.get("product_path", ""),
-        },
-        # --- Task Description ---
-        "task_description": task_data.get("task_description", ""),
-        # --- Video Configuration ---
-        "target_length_seconds": target_length,
-        "num_segments": num_segments,
-        # --- Kling 3.0 API Configuration ---
-        "kling_config": {
-            # CRITICAL: Enable Elements/Reference feature to lock the avatar's
-            # facial features from the base image. Without this, Kling will
-            # generate inconsistent faces across segments.
-            "use_elements_locking": True,
-            # CRITICAL: Enforce the exact prompt layer ordering required by
-            # Kling 3.0 for optimal results:
-            # Scene -> Character -> Action -> Camera -> Style
-            "prompt_structure": "Scene -> Character -> Action -> Camera -> Style",
-            # Kling API hard limit per segment
-            "max_segment_seconds": 15,
-            # When target > 15s, chaining is used:
-            # The final frame of segment A becomes the starting frame of segment B.
-            # This maintains visual continuity across segments.
-            "chain_segments": needs_chaining,
-            # Audio constraints: Kling requires clean, dry audio for lip-sync.
-            # Background music must be added ONLY during post-production assembly.
-            "audio_source": "voiceovers",  # NOT audio_sfx
-            "audio_note": "Clean dry audio only. BGM added in post.",
-        },
-        # --- Planka Integration (Future) ---
-        # When Planka integration is active, each job creates a card:
-        # "planka_config": {
-        #     "project_id": "...",
-        #     "board_id": "...",
-        #     "create_card": True,
-        #     "card_title": f"Video: {task_data.get('task_description', '')[:50]}",
-        #     "initial_list": "In Progress",
-        # },
-    }
-
-    # Log the payload for debugging (would be sent to OpenClaw in production)
-    _payload_json = json.dumps(payload, indent=2, ensure_ascii=False)
-
-    # =========================================================================
-    # STEP 2: Agent Status Streaming
-    # =========================================================================
-    # In production, these status updates would come from the OpenClaw event
-    # stream (via WebSocket, SSE, or polling the /api/v1/jobs/{id}/status endpoint).
-
-    agent_stages = [
-        ("\U0001f50d Analyst parsing customer pain points...", 3),
-        ("\u270d\ufe0f Scriptwriter writing hooks...", 3),
-        (
-            "\U0001f3a8 Prompt Engineer working with Kling 3.0...\n"
-            f"   Prompt structure: Scene > Character > Action > Camera > Style",
-            3,
-        ),
-    ]
-
-    for status_text, delay in agent_stages:
-        try:
-            await status_message.edit_text(
-                f"\U0001f3ac <b>OpenClaw Pipeline Active</b>\n\n{status_text}"
-            )
-        except Exception:
-            pass  # Message might not have changed
-        await asyncio.sleep(delay)
-
-    # =========================================================================
-    # STEP 3: Kling API Polling Simulation
-    # =========================================================================
-    # The real Kling API workflow:
-    # 1. POST /api/v1/lip-sync  (submit the job)
-    # 2. GET  /api/v1/lip-sync/{task_id}  (poll for completion)
-    # The API returns status: "pending" | "processing" | "completed" | "failed"
-    # Typical processing time: 30-120 seconds per segment.
-
-    max_attempts = 10
-    for segment in range(1, num_segments + 1):
-        segment_label = f" (Segment {segment}/{num_segments})" if needs_chaining else ""
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                status_text = (
-                    f"\u23f3 Kling 3.0 API rendering{segment_label}\n"
-                    f"   Attempt {attempt}/{max_attempts}..."
-                )
-                if needs_chaining and segment > 1:
-                    status_text += (
-                        "\n   \U0001f517 Chaining: using last frame of "
-                        f"segment {segment - 1} as start frame"
-                    )
-
-                await status_message.edit_text(
-                    f"\U0001f3ac <b>OpenClaw Pipeline Active</b>\n\n{status_text}"
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
-            # Simulate completion after a few attempts
-            if attempt >= 3:
-                break
-
-    # =========================================================================
-    # STEP 4: Final Assembly
-    # =========================================================================
+    # Fast path
     try:
-        await status_message.edit_text(
-            "\U0001f3ac <b>OpenClaw Pipeline Active</b>\n\n"
-            "\U0001f39e Manager assembling final video...\n"
-            "   Merging segments, adding BGM from audio_sfx, "
-            "applying transitions..."
-        )
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
         pass
-    await asyncio.sleep(3)
 
-    # =========================================================================
-    # STEP 5: Retrieve Output
-    # =========================================================================
-    # In production, the OpenClaw Gateway would return the output file path
-    # or a download URL. For now, we look for the latest .mp4 in output/videos/.
+    # Strip fenced blocks
+    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    if fence:
+        return json.loads(fence.group(1))
 
+    # Brute-force first balanced object
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict):
+                            return obj
+                    except Exception:
+                        pass
+                    break
+        start = text.find("{", start + 1)
+
+    raise ValueError("No valid JSON object found in agent output")
+
+
+async def _run_openclaw_agent(agent_id: str, session_id: str, prompt: str, timeout: int = 600) -> str:
+    """
+    Run one OpenClaw agent turn via CLI and return assistant text.
+    Requires local gateway running.
+    """
+    cmd = (
+        f"openclaw agent --agent {shlex.quote(agent_id)} "
+        f"--session-id {shlex.quote(session_id)} "
+        f"--message {shlex.quote(prompt)} --json --timeout {int(timeout)}"
+    )
+
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out_b, err_b = await proc.communicate()
+    out = out_b.decode("utf-8", errors="replace")
+    err = err_b.decode("utf-8", errors="replace")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"openclaw agent failed ({agent_id}): {err or out}")
+
+    try:
+        payload = json.loads(out)
+    except Exception:
+        # Fallback: return raw; caller will attempt JSON extraction
+        return out
+
+    # Best-effort output extraction across possible CLI payload shapes
+    for path in [
+        ("result", "output"),
+        ("result", "message"),
+        ("output",),
+        ("message",),
+        ("text",),
+    ]:
+        cur: Any = payload
+        ok = True
+        for key in path:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, str) and cur.strip():
+            return cur
+
+    # Last resort
+    return out
+
+
+def _build_pipeline_payload(task_data: dict[str, Any]) -> dict[str, Any]:
+    target_length = int(task_data.get("target_length_seconds", 15))
+    num_segments = max(1, (target_length + 14) // 15)
+
+    return {
+        "job_id": str(uuid.uuid4()),
+        "created_at": _now_iso(),
+        "created_by": "telegram_bot",
+        "assets": {
+            "avatar": {
+                "folder": task_data.get("avatar_folder", ""),
+                "path": task_data.get("avatar_path", ""),
+                "face_reference": f"{task_data.get('avatar_path', '').rstrip('/')}/front_medium.png",
+            },
+            "location": {
+                "folder": task_data.get("location_folder", ""),
+                "path": task_data.get("location_path", ""),
+                "background": f"{task_data.get('location_path', '').rstrip('/')}/medium_shot.png",
+            },
+            "product": {
+                "folder": task_data.get("product_folder", ""),
+                "path": task_data.get("product_path", ""),
+                "hero_image": f"{task_data.get('product_path', '').rstrip('/')}/product_front.png",
+            },
+        },
+        "task": {
+            "description": task_data.get("task_description", ""),
+            "target_length_seconds": target_length,
+            "num_segments": num_segments,
+        },
+        "kling_config": {
+            "use_elements_locking": True,
+            "prompt_structure": "Scene -> Character -> Action -> Camera -> Style",
+            "max_segment_seconds": 15,
+            "chain_segments": target_length > 15,
+            "audio_source": "voiceovers",
+            "aspect_ratio": "9:16",
+            "resolution": "1080x1920",
+        },
+        "pipeline": [
+            {"agent": "analyst", "status": "pending"},
+            {"agent": "scriptwriter", "status": "pending"},
+            {"agent": "prompt_engineer", "status": "pending"},
+            {"agent": "video_generator", "status": "pending"},
+            {"agent": "assembly_manager", "status": "pending"},
+        ],
+    }
+
+
+def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Path) -> str:
+    base = [
+        f"Read job payload at: {job_path}",
+        "Return JSON only. No markdown. No prose.",
+        f"Write final JSON to: {out_path}",
+    ]
+    if in_path:
+        base.insert(1, f"Read previous stage output at: {in_path}")
+
+    if stage == "analyst":
+        spec = (
+            "You are analyst. Produce JSON with keys: product_name,target_audience,pain_points,key_hooks,"
+            "competitive_angle,cta_suggestion. pain_points 3-5 items."
+        )
+    elif stage == "scriptwriter":
+        spec = (
+            "You are scriptwriter. Produce timed UGC JSON with keys: title,total_duration_seconds,segments,"
+            "voiceover_instructions. Each segment <=15 seconds and has segment_id,duration_seconds,spoken_text,visual_direction,emotion."
+        )
+    else:
+        spec = (
+            "You are prompt_engineer. Produce JSON: {segments:[...]} where each segment has segment_id,kling_prompt,"
+            "elements_config,generation_params. kling_prompt.prompt_structure_verified must be exactly"
+            " 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'."
+        )
+
+    return "\n".join([spec, *base])
+
+
+async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot) -> Path | None:
+    """
+    Execute orchestration pipeline connected to OpenClaw agents.
+
+    LLM stages are real OpenClaw calls; video/tool stages currently represented
+    as status placeholders unless external tool runners are wired.
+    """
+    payload = _build_pipeline_payload(task_data)
+    job_id = payload["job_id"]
+    session_id = f"video-pipeline:{job_id}"
+
+    job_dir = _jobs_dir() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    job_path = job_dir / "job_payload.json"
+    analyst_path = job_dir / "analyst_output.json"
+    script_path = job_dir / "scriptwriter_output.json"
+    prompt_path = job_dir / "prompt_engineer_output.json"
+
+    job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    try:
+        # Stage 1: Analyst
+        await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🔍 Analyst running...")
+        analyst_raw = await _run_openclaw_agent(
+            "analyst",
+            session_id,
+            _stage_prompt("analyst", job_path=job_path, in_path=None, out_path=analyst_path),
+        )
+        analyst_json = _extract_first_json_object(analyst_raw)
+        analyst_path.write_text(json.dumps(analyst_json, indent=2, ensure_ascii=False))
+
+        # Stage 2: Scriptwriter
+        await status_message.edit_text("🎬 <b>Pipeline</b>\n\n✍️ Scriptwriter running...")
+        script_raw = await _run_openclaw_agent(
+            "scriptwriter",
+            session_id,
+            _stage_prompt("scriptwriter", job_path=job_path, in_path=analyst_path, out_path=script_path),
+        )
+        script_json = _extract_first_json_object(script_raw)
+        script_path.write_text(json.dumps(script_json, indent=2, ensure_ascii=False))
+
+        # Stage 3: Prompt Engineer
+        await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🎨 Prompt Engineer running...")
+        prompt_raw = await _run_openclaw_agent(
+            "prompt_engineer",
+            session_id,
+            _stage_prompt("prompt_engineer", job_path=job_path, in_path=script_path, out_path=prompt_path),
+        )
+        prompt_json = _extract_first_json_object(prompt_raw)
+        prompt_path.write_text(json.dumps(prompt_json, indent=2, ensure_ascii=False))
+
+        # Tool stages: connected as placeholders until wrappers are bound
+        await status_message.edit_text(
+            "🎬 <b>Pipeline</b>\n\n📹 Video Generator stage prepared (Kling wrapper pending)..."
+        )
+        await asyncio.sleep(1)
+        await status_message.edit_text(
+            "🎬 <b>Pipeline</b>\n\n🎞️ Assembly Manager stage prepared (ffmpeg wrapper pending)..."
+        )
+        await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.exception("OpenClaw pipeline failed")
+        (job_dir / "error.txt").write_text(str(e))
+        try:
+            await status_message.edit_text(
+                f"❌ <b>Pipeline failed</b>\n\n<code>{str(e)[:1200]}</code>\n\n"
+                f"Job folder: <code>{job_dir}</code>"
+            )
+        except Exception:
+            pass
+        return None
+
+    # Existing delivery behavior: latest output video if present
     video_path = await get_latest_video()
 
     if video_path:
         try:
             await status_message.edit_text(
-                f"\u2705 <b>Pipeline complete!</b>\n\nOutput: <code>{video_path.name}</code>"
+                f"✅ <b>Pipeline complete</b>\n\nOutput: <code>{video_path.name}</code>\n"
+                f"Job: <code>{job_id}</code>"
             )
         except Exception:
             pass
     else:
         try:
             await status_message.edit_text(
-                "\u26a0\ufe0f <b>Pipeline complete</b> but no output video found.\n\n"
-                "Place a test .mp4 file in <code>output/videos/</code> "
-                "to test the delivery flow."
+                "✅ <b>LLM stages complete</b>\n\n"
+                f"Saved artifacts in <code>{job_dir}</code>\n"
+                "No final video found yet (tool stages are scaffolded)."
             )
         except Exception:
             pass
