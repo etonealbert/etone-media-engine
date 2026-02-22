@@ -1,0 +1,218 @@
+"""
+Inline keyboard builders for the Telegram bot UI.
+All keyboards use InlineKeyboardBuilder with CallbackData factories
+to stay under the 64-byte callback_data limit.
+"""
+
+from aiogram.types import InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from bot.config import CATEGORY_LABELS, SUBFOLDER_CATEGORIES
+from bot.database import get_assets_by_category, get_unique_folders
+from bot.keyboards.callbacks import (
+    AssetCB,
+    CancelCB,
+    CategoryCB,
+    ConfirmCB,
+    FolderCB,
+    GenerateCB,
+    LengthCB,
+)
+from bot.utils.pagination import paginate
+
+
+def category_picker_keyboard() -> InlineKeyboardMarkup:
+    """
+    Build the category selection keyboard for file uploads.
+    Layout: 2 buttons per row, Cancel alone on last row.
+    """
+    builder = InlineKeyboardBuilder()
+
+    for cat_key, label in CATEGORY_LABELS.items():
+        builder.button(
+            text=label,
+            callback_data=CategoryCB(action="select", name=cat_key),
+        )
+
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=CancelCB(),
+    )
+
+    # 2 buttons per row for categories, Cancel alone
+    builder.adjust(2, 2, 2, 1)
+    return builder.as_markup()
+
+
+def folder_choice_keyboard(category: str) -> InlineKeyboardMarkup:
+    """
+    Ask whether to save to a new or existing folder.
+    Only used for subfolder-based categories.
+    """
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="\U0001f4c1 New Folder",
+        callback_data=FolderCB(action="new", cat=category),
+    )
+    builder.button(
+        text="\U0001f4c2 Existing Folder",
+        callback_data=FolderCB(action="existing", cat=category),
+    )
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=CancelCB(),
+    )
+
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+async def folder_list_keyboard(
+    category: str,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """
+    Build a paginated list of existing folders for a subfolder-based category.
+    Uses DB queries (not disk reads) for speed.
+    """
+    folders = await get_unique_folders(category)
+    page_items, has_prev, has_next = paginate(folders, page, per_page=6)
+
+    builder = InlineKeyboardBuilder()
+
+    for folder in page_items:
+        folder_name = folder.get("folder_name", "unknown")
+        display = folder_name[:30] + "..." if len(folder_name) > 33 else folder_name
+        # Use a synthetic id based on folder position; we pass folder info via FSM
+        builder.button(
+            text=display,
+            callback_data=FolderCB(
+                action="select",
+                cat=category,
+                id=hash(folder_name) % 100000,  # Short numeric reference
+            ),
+        )
+
+    # Navigation row
+    nav_buttons = []
+    if has_prev:
+        nav_buttons.append(("< Prev", page - 1))
+    if has_next:
+        nav_buttons.append(("Next >", page + 1))
+
+    for text, pg in nav_buttons:
+        builder.button(
+            text=text,
+            callback_data=AssetCB(action="page", id=0, page=pg),
+        )
+
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=CancelCB(),
+    )
+
+    # Items in 1 column, nav in a row, cancel alone
+    rows = [1] * len(page_items)
+    if nav_buttons:
+        rows.append(len(nav_buttons))
+    rows.append(1)
+    builder.adjust(*rows)
+
+    return builder.as_markup()
+
+
+async def asset_list_keyboard(
+    category: str,
+    page: int = 0,
+    cb_action: str = "select",
+) -> InlineKeyboardMarkup:
+    """
+    Build a paginated inline keyboard of assets/folders from the DB.
+    For subfolder categories: shows unique folders.
+    For flat categories: shows individual files.
+    """
+    if category in SUBFOLDER_CATEGORIES:
+        items = await get_unique_folders(category)
+        name_key = "folder_name"
+    else:
+        items = await get_assets_by_category(category)
+        name_key = "file_name"
+
+    page_items, has_prev, has_next = paginate(items, page, per_page=6)
+
+    builder = InlineKeyboardBuilder()
+
+    for item in page_items:
+        name = item.get(name_key, "unknown")
+        display = name[:30] + "..." if len(name) > 33 else name
+        item_id = item.get("id", 0) or 0
+
+        builder.button(
+            text=display,
+            callback_data=GenerateCB(action=cb_action, id=item_id, page=page),
+        )
+
+    # Navigation
+    nav_count = 0
+    if has_prev:
+        builder.button(
+            text="\u25c0 Prev",
+            callback_data=GenerateCB(action=cb_action, id=0, page=page - 1),
+        )
+        nav_count += 1
+    if has_next:
+        builder.button(
+            text="Next \u25b6",
+            callback_data=GenerateCB(action=cb_action, id=0, page=page + 1),
+        )
+        nav_count += 1
+
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=CancelCB(),
+    )
+
+    rows = [1] * len(page_items)
+    if nav_count:
+        rows.append(nav_count)
+    rows.append(1)
+    builder.adjust(*rows)
+
+    return builder.as_markup()
+
+
+def length_picker_keyboard() -> InlineKeyboardMarkup:
+    """Build keyboard for target video length selection."""
+    builder = InlineKeyboardBuilder()
+
+    for seconds in [15, 30, 45, 60]:
+        builder.button(
+            text=f"{seconds}s",
+            callback_data=LengthCB(seconds=seconds),
+        )
+
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=CancelCB(),
+    )
+
+    builder.adjust(4, 1)
+    return builder.as_markup()
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    """Build confirmation keyboard for launching generation."""
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="\U0001f680 Launch",
+        callback_data=ConfirmCB(action="launch"),
+    )
+    builder.button(
+        text="\u274c Cancel",
+        callback_data=ConfirmCB(action="cancel"),
+    )
+
+    builder.adjust(2)
+    return builder.as_markup()
