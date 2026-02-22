@@ -358,6 +358,15 @@ This is the complete payload the Telegram bot constructs and sends to OpenClaw:
 
 **Total: 5 agents** — 3 LLM-based, 1 external API, 1 local tool.
 
+## HITL Override (Current Production Path)
+
+For Telegram `/generator`, current production flow is HITL:
+- `analyst -> scriptwriter -> prompt_engineer` run normally
+- `video_generator` is explicitly bypassed
+- card is routed to `08 Ready for Kling (Albert)`
+- Albert manually generates with Kling and submits output
+- `assembly_manager` resumes pipeline using Albert-provided media
+
 ## Environment Variables Needed for Full Pipeline
 
 ```env

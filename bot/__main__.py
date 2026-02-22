@@ -46,6 +46,7 @@ async def main() -> None:
             BotCommand(command="index", description="Reindex asset library"),
             BotCommand(command="create_asset", description="Create new asset folder"),
             BotCommand(command="generate", description="Generate video"),
+            BotCommand(command="generator", description="Generator mode (HITL)"),
             BotCommand(command="cancel", description="Cancel current operation"),
         ]
     )

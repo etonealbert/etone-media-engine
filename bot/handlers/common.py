@@ -38,6 +38,7 @@ async def start_handler(message: Message) -> None:
         "/create_asset - Create new asset folder\n"
         "/review - Browse and preview assets in the library\n"
         "/generate - Launch video generation wizard\n"
+        "/generator - Launch generator mode (HITL)\n"
         "/cancel - Cancel current operation\n"
         "/help - Show detailed help\n\n"
         "You can also send any file (photo, video, audio, document) "

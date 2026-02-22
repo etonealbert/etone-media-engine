@@ -1,46 +1,77 @@
 # OpenClaw Integration (Telegram Orchestration Bot)
 
-This doc explains how the `etone-media-engine` bot is connected to your OpenClaw agents.
+This doc explains how `etone-media-engine` orchestrates subagents with a Human-in-the-Loop (HITL) generation stage.
 
 ## Connected Agents
 
-Configured in your OpenClaw runtime:
-- `analyst` (model: `google-antigravity/claude-opus-4-6-thinking`)
-- `scriptwriter` (model: `google-antigravity/claude-opus-4-6-thinking`)
-- `prompt_engineer` (model: `google-antigravity/claude-sonnet-4-6`)
-- `video_generator`
+Configured in OpenClaw runtime:
+- `analyst`
+- `scriptwriter`
+- `prompt_engineer`
+- `video_generator` (currently bypassed in HITL mode)
 - `assembly_manager`
-- orchestrator agent: `main`
+- orchestrator: `main`
 
-## How the bot calls agents
+## Current `/generator` flow (HITL)
 
-File: `bot/services/openclaw.py`
-
-At `/generate` launch, the bot:
-1. Builds canonical job payload JSON
-2. Writes artifacts to `data/jobs/<job_id>/`
-3. Calls OpenClaw CLI sequentially:
-   - `openclaw agent --agent analyst ...`
-   - `openclaw agent --agent scriptwriter ...`
-   - `openclaw agent --agent prompt_engineer ...`
-4. Parses JSON output from each stage and writes:
-   - `analyst_output.json`
-   - `scriptwriter_output.json`
-   - `prompt_engineer_output.json`
+1. Telegram wizard collects assets + task + length + context.
+2. User selects generation mode:
+   - **Fully Autonomous** → visible but locked (coming soon)
+   - **Human-in-the-Loop (HITL)** → active
+3. Bot runs subagents sequentially:
+   - `analyst`
+   - `scriptwriter`
+   - `prompt_engineer`
+4. Bot pauses pipeline and creates HITL handoff artifacts.
+5. Bot routes Planka card to **"08 Ready for Kling (Albert)"** (if Planka env is configured).
+6. Albert generates video manually in Kling and sends file/link back in Telegram.
+7. Bot resumes pipeline with `assembly_manager` using Albert’s provided input.
 
 ## Runtime artifact layout
 
-- `data/jobs/<job_id>/job_payload.json`
-- `data/jobs/<job_id>/analyst_output.json`
-- `data/jobs/<job_id>/scriptwriter_output.json`
-- `data/jobs/<job_id>/prompt_engineer_output.json`
-- `data/jobs/<job_id>/error.txt` (if failed)
+For each job (`data/jobs/<job_id>/`):
+- `job_payload.json`
+- `analyst_output.json`
+- `scriptwriter_output.json`
+- `prompt_engineer_output.json`
+- `hitl_handoff.json` (approved generation payload + waiting state)
+- `human_kling_output.json` (file path or URL provided by Albert)
+- `assembly_output.json`
+- `error.txt` (if failed)
 
-## Current status of tool stages
+## Subagent integration details
 
-- `video_generator` and `assembly_manager` are represented in bot status flow,
-  but actual Kling/ffmpeg execution is still scaffolded in this repo.
-- Existing delivery behavior still checks `output/videos/` for latest `.mp4`.
+Primary integration file: `bot/services/openclaw.py`
+
+- `run_openclaw_agents(...)`:
+  - runs first 3 LLM subagents
+  - marks `video_generator` as `bypassed_hitl`
+  - sets `assembly_manager` to `waiting_human_input`
+  - writes handoff payload and returns `waiting_human`
+
+- `resume_pipeline_with_human_output(...)`:
+  - accepts manual Kling file path or URL
+  - writes `human_kling_output.json`
+  - calls `assembly_manager` subagent
+  - resolves final output path (agent-provided path or fallback latest output)
+
+## Planka routing configuration (optional)
+
+Set these in `.env` to enable routing at HITL handoff:
+
+```env
+PLANKA_BASE_URL=...
+PLANKA_TOKEN=...
+PLANKA_AUTH_HEADER=Authorization
+PLANKA_AUTH_PREFIX=Bearer
+PLANKA_BOARD_ID=...
+PLANKA_READY_FOR_KLING_LIST_ID=...
+
+# temporary/testing mapping used by current implementation
+PLANKA_CARD_ID_FOR_TESTING=...
+```
+
+If Planka env is not set, bot continues normally and only performs Telegram-based HITL handoff.
 
 ## Prerequisites
 
@@ -55,32 +86,25 @@ At `/generate` launch, the bot:
 uv run python -m bot
 ```
 
-2. In Telegram bot chat:
-- run `/generate`
-- select avatar/location/product
-- provide task and length
+2. In Telegram chat:
+- run `/generator`
+- complete wizard
+- choose HITL mode
 - launch
+- upload generated Kling video (or send URL)
 
-3. Verify artifacts appear under `data/jobs/<job_id>/`.
+3. Verify job artifacts under `data/jobs/<job_id>/`.
 
 ## Troubleshooting
 
-### "openclaw agent failed"
+### `openclaw agent failed`
 - Ensure gateway is up: `openclaw gateway status`
-- Ensure agent exists: `openclaw agents list --bindings`
+- Ensure agent exists and can run in CLI
 
 ### Invalid JSON from stage
-- Check stage output in logs and `error.txt`
-- Re-run pipeline; prompts enforce JSON-only output
+- Check `error.txt` and stage output files
+- Stage prompts enforce JSON-only outputs
 
 ### No final video delivered
-- This is expected until Kling + assembly runners are fully wired.
-- Put test `.mp4` in `output/videos/` to verify send flow.
-
-## Next wiring step (recommended)
-
-Replace tool-stage placeholders with real calls:
-- `integrations/kling_client.py` for generation/lip-sync/download
-- `integrations/ffmpeg_assembly.py` for concat/mix/export
-
-Then let bot use generated final path from manifest instead of `get_latest_video()` fallback.
+- Check `assembly_output.json`
+- Verify `final_video_path` exists or fallback output is produced

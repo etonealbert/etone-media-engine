@@ -17,6 +17,7 @@ from bot.keyboards.callbacks import (
     FolderCB,
     GenerateCB,
     LengthCB,
+    ModeCB,
     SkipCB,
 )
 from bot.utils.pagination import paginate
@@ -223,16 +224,37 @@ def length_picker_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def generation_mode_keyboard() -> InlineKeyboardMarkup:
+    """Build mode picker: HITL active, autonomous locked for now."""
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="🔒 Fully Autonomous (Coming Soon / Locked)",
+        callback_data=ModeCB(action="auto"),
+    )
+    builder.button(
+        text="🧑‍💼 Human-in-the-Loop (HITL)",
+        callback_data=ModeCB(action="hitl"),
+    )
+    builder.button(
+        text="❌ Cancel",
+        callback_data=CancelCB(),
+    )
+
+    builder.adjust(1, 1, 1)
+    return builder.as_markup()
+
+
 def confirm_keyboard() -> InlineKeyboardMarkup:
     """Build confirmation keyboard for launching generation."""
     builder = InlineKeyboardBuilder()
 
     builder.button(
-        text="\U0001f680 Launch",
+        text="🚀 Launch",
         callback_data=ConfirmCB(action="launch"),
     )
     builder.button(
-        text="\u274c Cancel",
+        text="❌ Cancel",
         callback_data=ConfirmCB(action="cancel"),
     )
 

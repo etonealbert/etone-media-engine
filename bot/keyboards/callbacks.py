@@ -38,6 +38,12 @@ class GenerateCB(CallbackData, prefix="gen"):
     page: int = 0  # pagination page number
 
 
+class ModeCB(CallbackData, prefix="md"):
+    """Generation mode selector callbacks."""
+
+    action: str  # "hitl" | "auto"
+
+
 class LengthCB(CallbackData, prefix="len"):
     """Target video length selection."""
 

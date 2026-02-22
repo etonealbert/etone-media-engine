@@ -12,6 +12,7 @@ generation with whatever data was provided. Steps:
 """
 
 import logging
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, StateFilter
@@ -19,13 +20,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from bot.database import get_asset_by_id, get_unique_folders
-from bot.keyboards.callbacks import CancelCB, ConfirmCB, GenerateCB, LengthCB, SkipCB
+from bot.keyboards.callbacks import CancelCB, ConfirmCB, GenerateCB, LengthCB, ModeCB, SkipCB
 from bot.keyboards.inline import (
     asset_list_keyboard,
     confirm_keyboard,
+    generation_mode_keyboard,
     length_picker_keyboard,
 )
-from bot.services.openclaw import run_openclaw_agents
+from bot.services.openclaw import resume_pipeline_with_human_output, run_openclaw_agents
 from bot.states.generate import GenerateStates
 
 logger = logging.getLogger(__name__)
@@ -76,7 +78,7 @@ def _build_progress(data: dict, current_step: int) -> str:
 # =============================================================================
 
 
-@router.message(Command("generate"))
+@router.message(Command(commands=["generate", "generator"]))
 async def generate_start_handler(message: Message, state: FSMContext) -> None:
     """Start the video generation wizard. Step 1: Select avatar."""
     await state.clear()
@@ -424,10 +426,22 @@ async def context_entered_handler(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(creative_context=context_text)
-    data = await state.get_data()
 
-    # Move to confirmation
-    await _show_confirm(message, state, data)
+    # Move to mode selection
+    await _go_to_mode_selection(message, state)
+
+
+async def _go_to_mode_selection(source: Message | CallbackQuery, state: FSMContext) -> None:
+    """Transition to mode selection step."""
+    await state.set_state(GenerateStates.select_mode)
+    text = (
+        "<b>Step 7/7:</b> Choose generation mode\n\n"
+        "Choose how to run the generation stage before assembly."
+    )
+    if isinstance(source, CallbackQuery):
+        await source.message.edit_text(text, reply_markup=generation_mode_keyboard())
+    else:
+        await source.answer(text, reply_markup=generation_mode_keyboard())
 
 
 async def _show_confirm(
@@ -453,6 +467,9 @@ async def _show_confirm(
             return f"{icon} <b>{label}:</b> <code>{display}</code>"
         return f"{icon} <b>{label}:</b> <i>skipped</i>"
 
+    mode = data.get("generation_mode", "hitl")
+    mode_label = "Human-in-the-Loop (HITL)" if mode == "hitl" else "Autonomous (Locked)"
+
     summary = "\n".join(
         [
             _field("Avatar", "avatar_name", "\U0001f9d1"),
@@ -461,6 +478,7 @@ async def _show_confirm(
             _field("Task", "task_description", "\U0001f4dd"),
             f"\u23f1 <b>Length:</b> {seconds}s",
             _field("Context", "creative_context", "\U0001f3a8"),
+            f"⚙️ <b>Mode:</b> {mode_label}",
         ]
     )
 
@@ -518,10 +536,29 @@ async def skip_step_handler(
         await state.update_data(target_length_seconds=DEFAULT_LENGTH)
         await _go_to_step_6(callback, state)
     elif step == "context":
-        # Skip context -> go to confirm
-        data = await state.get_data()
-        await _show_confirm(callback, state, data)
+        # Skip context -> mode selection
+        await _go_to_mode_selection(callback, state)
 
+    await callback.answer()
+
+
+# =============================================================================
+# Mode selection
+# =============================================================================
+
+
+@router.callback_query(GenerateStates.select_mode, ModeCB.filter(F.action == "auto"))
+async def mode_autonomous_locked_handler(callback: CallbackQuery) -> None:
+    """Autonomous mode is visible but locked for now."""
+    await callback.answer("Autonomous mode is coming soon and currently locked.", show_alert=True)
+
+
+@router.callback_query(GenerateStates.select_mode, ModeCB.filter(F.action == "hitl"))
+async def mode_hitl_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    """Enable HITL mode and continue to confirmation."""
+    await state.update_data(generation_mode="hitl")
+    data = await state.get_data()
+    await _show_confirm(callback, state, data)
     await callback.answer()
 
 
@@ -539,7 +576,6 @@ async def launch_handler(
 ) -> None:
     """Launch the OpenClaw agent pipeline."""
     data = await state.get_data()
-    await state.clear()
 
     status_msg = await callback.message.edit_text("\U0001f3ac <b>Launching OpenClaw agents...</b>")
 
@@ -558,34 +594,36 @@ async def launch_handler(
         "creative_context": data.get("creative_context", ""),
     }
 
-    video_path = await run_openclaw_agents(task_data, status_msg, bot)
+    generation_mode = data.get("generation_mode", "hitl")
+    result = await run_openclaw_agents(task_data, status_msg, bot, generation_mode=generation_mode)
 
-    if video_path and video_path.exists():
-        try:
-            video_file = FSInputFile(str(video_path), filename=video_path.name)
-            await bot.send_video(
-                chat_id=callback.message.chat.id,
-                video=video_file,
-                caption="\U0001f525 Your video is ready!",
-            )
-        except Exception as e:
-            logger.error(f"Failed to send video: {e}")
-            await bot.send_message(
-                chat_id=callback.message.chat.id,
-                text=f"\u26a0\ufe0f Video generated but failed to send: {e}\n"
-                f"File: <code>{video_path}</code>",
-            )
-    else:
+    if result.get("status") == "waiting_human":
+        job_id = result.get("job_id", "")
+        await state.set_state(GenerateStates.wait_human_kling_output)
+        await state.update_data(job_id=job_id)
         await bot.send_message(
             chat_id=callback.message.chat.id,
             text=(
-                "\U0001f3ac Pipeline finished!\n\n"
-                "No output video found. To test delivery:\n"
-                "1. Place a .mp4 file in <code>output/videos/</code>\n"
-                "2. Run /generate again"
+                "⏳ <b>Waiting for manual Kling output</b>\n\n"
+                f"Job: <code>{job_id}</code>\n"
+                "Please upload the generated video file (or paste URL) now.\n"
+                "Once received, I will run <b>assembly_manager</b> and continue the pipeline."
             ),
         )
+        await callback.answer()
+        return
 
+    await state.clear()
+    if result.get("status") == "failed":
+        await bot.send_message(
+            chat_id=callback.message.chat.id,
+            text="❌ Pipeline failed before HITL handoff. Check previous error message.",
+        )
+    else:
+        await bot.send_message(
+            chat_id=callback.message.chat.id,
+            text="⚠️ Autonomous mode is locked. Please choose HITL mode.",
+        )
     await callback.answer()
 
 
@@ -598,6 +636,70 @@ async def generation_cancel_handler(
     await state.clear()
     await callback.message.edit_text("Video generation cancelled.")
     await callback.answer()
+
+
+@router.message(GenerateStates.wait_human_kling_output, F.video | F.document)
+async def hitl_media_received_handler(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Accept manually generated Kling media and resume pipeline with assembly_manager."""
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    if not job_id:
+        await message.answer("Missing job context. Please restart /generator.")
+        await state.clear()
+        return
+
+    jobs_root = Path("data/jobs") / job_id / "human_uploads"
+    jobs_root.mkdir(parents=True, exist_ok=True)
+
+    file = message.video or message.document
+    filename = getattr(file, "file_name", None) or f"{file.file_id}.mp4"
+    target = jobs_root / filename
+
+    try:
+        file_info = await bot.get_file(file.file_id)
+        await bot.download(file_info, destination=target)
+    except Exception as e:
+        await message.answer(f"Failed to download upload: {e}")
+        return
+
+    status_msg = await message.answer("📥 Upload received. Resuming assembly pipeline...")
+    video_path = await resume_pipeline_with_human_output(
+        job_id=job_id,
+        human_video_path=str(target),
+        human_video_url=None,
+        status_message=status_msg,
+    )
+
+    if video_path and video_path.exists():
+        video_file = FSInputFile(str(video_path), filename=video_path.name)
+        await bot.send_video(chat_id=message.chat.id, video=video_file, caption="🔥 Final video ready!")
+
+    await state.clear()
+
+
+@router.message(GenerateStates.wait_human_kling_output, F.text)
+async def hitl_url_received_handler(message: Message, state: FSMContext) -> None:
+    """Accept URL from Albert and resume assembly stage."""
+    url = (message.text or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await message.answer("Please send a valid URL or upload a video file.")
+        return
+
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    if not job_id:
+        await message.answer("Missing job context. Please restart /generator.")
+        await state.clear()
+        return
+
+    status_msg = await message.answer("🔗 URL received. Resuming assembly pipeline...")
+    await resume_pipeline_with_human_output(
+        job_id=job_id,
+        human_video_path=None,
+        human_video_url=url,
+        status_message=status_msg,
+    )
+    await state.clear()
 
 
 # =============================================================================
@@ -613,7 +715,9 @@ async def generation_cancel_handler(
         GenerateStates.enter_task,
         GenerateStates.select_length,
         GenerateStates.enter_context,
+        GenerateStates.select_mode,
         GenerateStates.confirm,
+        GenerateStates.wait_human_kling_output,
     ),
     CancelCB.filter(),
 )

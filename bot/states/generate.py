@@ -14,4 +14,6 @@ class GenerateStates(StatesGroup):
     enter_task = State()  # Step 4: Amazon link or task description (optional)
     select_length = State()  # Step 5: Target video length (optional, default 15s)
     enter_context = State()  # Step 6: Creative context / wishes (optional)
-    confirm = State()  # Step 7: Review summary and confirm launch
+    select_mode = State()  # Step 7: Select generation mode (HITL or Autonomous)
+    confirm = State()  # Step 8: Review summary and confirm launch
+    wait_human_kling_output = State()  # Waiting for Albert manual Kling result

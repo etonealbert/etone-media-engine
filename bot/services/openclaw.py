@@ -2,17 +2,18 @@
 OpenClaw pipeline integration service.
 
 This module runs the first 3 LLM stages through real OpenClaw agents
-(analyst -> scriptwriter -> prompt_engineer) and keeps tool stages as
-status-tracked placeholders unless external tool runners are attached.
+(analyst -> scriptwriter -> prompt_engineer) and supports HITL handoff
+between prompt_engineer and assembly_manager.
 """
 
 import asyncio
 import json
 import logging
-import os
 import re
 import shlex
-import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,13 +39,8 @@ def _jobs_dir() -> Path:
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any]:
-    """
-    Extract first valid JSON object from model output.
-    Handles cases where model wraps JSON in prose/code fences.
-    """
     text = text.strip()
 
-    # Fast path
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
@@ -52,12 +48,10 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    # Strip fenced blocks
     fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if fence:
         return json.loads(fence.group(1))
 
-    # Brute-force first balanced object
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -82,10 +76,6 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
 
 
 async def _run_openclaw_agent(agent_id: str, session_id: str, prompt: str, timeout: int = 600) -> str:
-    """
-    Run one OpenClaw agent turn via CLI and return assistant text.
-    Requires local gateway running.
-    """
     cmd = (
         f"openclaw agent --agent {shlex.quote(agent_id)} "
         f"--session-id {shlex.quote(session_id)} "
@@ -107,10 +97,8 @@ async def _run_openclaw_agent(agent_id: str, session_id: str, prompt: str, timeo
     try:
         payload = json.loads(out)
     except Exception:
-        # Fallback: return raw; caller will attempt JSON extraction
         return out
 
-    # Best-effort output extraction across possible CLI payload shapes
     for path in [
         ("result", "output"),
         ("result", "message"),
@@ -129,7 +117,6 @@ async def _run_openclaw_agent(agent_id: str, session_id: str, prompt: str, timeo
         if ok and isinstance(cur, str) and cur.strip():
             return cur
 
-    # Last resort
     return out
 
 
@@ -141,6 +128,7 @@ def _build_pipeline_payload(task_data: dict[str, Any]) -> dict[str, Any]:
         "job_id": str(uuid.uuid4()),
         "created_at": _now_iso(),
         "created_by": "telegram_bot",
+        "generation_mode": task_data.get("generation_mode", "hitl"),
         "assets": {
             "avatar": {
                 "folder": task_data.get("avatar_folder", ""),
@@ -201,24 +189,88 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
             "You are scriptwriter. Produce timed UGC JSON with keys: title,total_duration_seconds,segments,"
             "voiceover_instructions. Each segment <=15 seconds and has segment_id,duration_seconds,spoken_text,visual_direction,emotion."
         )
-    else:
+    elif stage == "prompt_engineer":
         spec = (
             "You are prompt_engineer. Produce JSON: {segments:[...]} where each segment has segment_id,kling_prompt,"
             "elements_config,generation_params. kling_prompt.prompt_structure_verified must be exactly"
             " 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'."
         )
+    else:
+        spec = (
+            "You are assembly_manager. Produce JSON with keys: final_video_path,steps_executed,"
+            "audio_mix_notes,status. Use supplied human Kling output as source footage."
+        )
 
     return "\n".join([spec, *base])
 
 
-async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot) -> Path | None:
-    """
-    Execute orchestration pipeline connected to OpenClaw agents.
+def _find_pipeline_stage(payload: dict[str, Any], agent: str) -> dict[str, Any] | None:
+    for stage in payload.get("pipeline", []):
+        if stage.get("agent") == agent:
+            return stage
+    return None
 
-    LLM stages are real OpenClaw calls; video/tool stages currently represented
-    as status placeholders unless external tool runners are wired.
-    """
-    payload = _build_pipeline_payload(task_data)
+
+def _planka_request(path: str, method: str = "GET", body: dict[str, Any] | None = None) -> Any:
+    if not settings.planka_base_url or not settings.planka_token:
+        return None
+
+    url = f"{settings.planka_base_url.rstrip('/')}{path}"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+
+    auth_prefix = f"{settings.planka_auth_prefix} " if settings.planka_auth_prefix else ""
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            settings.planka_auth_header: f"{auth_prefix}{settings.planka_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:  # nosec - controlled URL from env
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else None
+
+
+async def _move_planka_card_to_ready_for_kling(job_id: str, approved_payload: dict[str, Any]) -> None:
+    if not settings.planka_board_id or not settings.planka_ready_for_kling_list_id:
+        return
+
+    # card id can be provided by orchestrator callback data later; for now use explicit env mapping
+    if not settings.planka_card_id_for_testing:
+        return
+
+    card_id = settings.planka_card_id_for_testing
+
+    description = (
+        f"HITL handoff for job {job_id}\n\n"
+        "Approved generation input (prompt_engineer):\n"
+        f"```json\n{json.dumps(approved_payload, ensure_ascii=False, indent=2)}\n```"
+    )
+
+    def _sync_calls() -> None:
+        try:
+            _planka_request(
+                f"/api/cards/{card_id}",
+                method="PATCH",
+                body={"listId": settings.planka_ready_for_kling_list_id, "description": description},
+            )
+        except urllib.error.HTTPError as e:
+            logger.warning("Planka routing failed for job %s: %s", job_id, e)
+
+    await asyncio.to_thread(_sync_calls)
+
+
+async def run_openclaw_agents(
+    task_data: dict,
+    status_message: Message,
+    bot: Bot,
+    generation_mode: str = "hitl",
+) -> dict[str, Any]:
+    payload = _build_pipeline_payload({**task_data, "generation_mode": generation_mode})
     job_id = payload["job_id"]
     session_id = f"video-pipeline:{job_id}"
 
@@ -229,11 +281,11 @@ async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot
     analyst_path = job_dir / "analyst_output.json"
     script_path = job_dir / "scriptwriter_output.json"
     prompt_path = job_dir / "prompt_engineer_output.json"
+    hitl_path = job_dir / "hitl_handoff.json"
 
     job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     try:
-        # Stage 1: Analyst
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🔍 Analyst running...")
         analyst_raw = await _run_openclaw_agent(
             "analyst",
@@ -242,8 +294,8 @@ async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot
         )
         analyst_json = _extract_first_json_object(analyst_raw)
         analyst_path.write_text(json.dumps(analyst_json, indent=2, ensure_ascii=False))
+        _find_pipeline_stage(payload, "analyst")["status"] = "done"
 
-        # Stage 2: Scriptwriter
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n✍️ Scriptwriter running...")
         script_raw = await _run_openclaw_agent(
             "scriptwriter",
@@ -252,8 +304,8 @@ async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot
         )
         script_json = _extract_first_json_object(script_raw)
         script_path.write_text(json.dumps(script_json, indent=2, ensure_ascii=False))
+        _find_pipeline_stage(payload, "scriptwriter")["status"] = "done"
 
-        # Stage 3: Prompt Engineer
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🎨 Prompt Engineer running...")
         prompt_raw = await _run_openclaw_agent(
             "prompt_engineer",
@@ -262,16 +314,41 @@ async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot
         )
         prompt_json = _extract_first_json_object(prompt_raw)
         prompt_path.write_text(json.dumps(prompt_json, indent=2, ensure_ascii=False))
+        _find_pipeline_stage(payload, "prompt_engineer")["status"] = "done"
 
-        # Tool stages: connected as placeholders until wrappers are bound
-        await status_message.edit_text(
-            "🎬 <b>Pipeline</b>\n\n📹 Video Generator stage prepared (Kling wrapper pending)..."
-        )
-        await asyncio.sleep(1)
-        await status_message.edit_text(
-            "🎬 <b>Pipeline</b>\n\n🎞️ Assembly Manager stage prepared (ffmpeg wrapper pending)..."
-        )
-        await asyncio.sleep(1)
+        if generation_mode == "hitl":
+            _find_pipeline_stage(payload, "video_generator")["status"] = "bypassed_hitl"
+            _find_pipeline_stage(payload, "assembly_manager")["status"] = "waiting_human_input"
+
+            handoff = {
+                "job_id": job_id,
+                "status": "waiting_for_human_kling_output",
+                "ready_for_kling_column": "08 Ready for Kling (Albert)",
+                "approved_generation_input": prompt_json,
+                "task_summary": payload.get("task", {}),
+                "created_at": _now_iso(),
+            }
+            hitl_path.write_text(json.dumps(handoff, indent=2, ensure_ascii=False))
+            job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+            await _move_planka_card_to_ready_for_kling(job_id, prompt_json)
+
+            await status_message.edit_text(
+                "⏸️ <b>Pipeline paused for HITL</b>\n\n"
+                f"Job: <code>{job_id}</code>\n"
+                "Prompt package is ready.\n"
+                "Please generate video manually in Kling and upload the result here."
+            )
+            return {
+                "status": "waiting_human",
+                "job_id": job_id,
+                "job_dir": str(job_dir),
+                "hitl_handoff_path": str(hitl_path),
+                "approved_generation_input": prompt_json,
+            }
+
+        await status_message.edit_text("🚧 Autonomous mode is currently locked.")
+        return {"status": "locked", "job_id": job_id, "job_dir": str(job_dir)}
 
     except Exception as e:
         logger.exception("OpenClaw pipeline failed")
@@ -283,27 +360,82 @@ async def run_openclaw_agents(task_data: dict, status_message: Message, bot: Bot
             )
         except Exception:
             pass
-        return None
+        return {"status": "failed", "error": str(e), "job_id": job_id, "job_dir": str(job_dir)}
 
-    # Existing delivery behavior: latest output video if present
-    video_path = await get_latest_video()
+
+async def resume_pipeline_with_human_output(
+    job_id: str,
+    human_video_path: str | None,
+    human_video_url: str | None,
+    status_message: Message,
+) -> Path | None:
+    job_dir = _jobs_dir() / job_id
+    job_path = job_dir / "job_payload.json"
+    prompt_path = job_dir / "prompt_engineer_output.json"
+    assembly_out = job_dir / "assembly_output.json"
+    human_input_manifest = job_dir / "human_kling_output.json"
+
+    if not job_path.exists() or not prompt_path.exists():
+        raise RuntimeError(f"Job artifacts missing for {job_id}")
+
+    payload = json.loads(job_path.read_text())
+    prompt_json = json.loads(prompt_path.read_text())
+
+    human_input_manifest.write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "submitted_at": _now_iso(),
+                "video_path": human_video_path,
+                "video_url": human_video_url,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+
+    await status_message.edit_text("🎞️ <b>Assembly Manager running...</b>")
+
+    stage_prompt = (
+        _stage_prompt("assembly_manager", job_path, prompt_path, assembly_out)
+        + "\n"
+        + f"Read human Kling output manifest at: {human_input_manifest}\n"
+        + "Treat video_path or video_url as the source generated footage and continue pipeline."
+    )
+    session_id = f"video-pipeline:{job_id}:resume"
+    assembly_raw = await _run_openclaw_agent("assembly_manager", session_id, stage_prompt)
+    try:
+        assembly_json = _extract_first_json_object(assembly_raw)
+    except Exception:
+        assembly_json = {"raw": assembly_raw}
+    assembly_out.write_text(json.dumps(assembly_json, indent=2, ensure_ascii=False))
+
+    stage = _find_pipeline_stage(payload, "assembly_manager")
+    if stage:
+        stage["status"] = "done"
+    payload["status"] = "completed"
+    job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    video_path = None
+    final_from_agent = assembly_json.get("final_video_path") if isinstance(assembly_json, dict) else None
+    if isinstance(final_from_agent, str) and final_from_agent.strip():
+        candidate = Path(final_from_agent.strip())
+        if not candidate.is_absolute():
+            candidate = settings.base_dir / candidate
+        if candidate.exists():
+            video_path = candidate
+
+    if video_path is None:
+        video_path = await get_latest_video()
 
     if video_path:
-        try:
-            await status_message.edit_text(
-                f"✅ <b>Pipeline complete</b>\n\nOutput: <code>{video_path.name}</code>\n"
-                f"Job: <code>{job_id}</code>"
-            )
-        except Exception:
-            pass
+        await status_message.edit_text(
+            f"✅ <b>Pipeline complete</b>\n\nOutput: <code>{video_path.name}</code>\nJob: <code>{job_id}</code>"
+        )
     else:
-        try:
-            await status_message.edit_text(
-                "✅ <b>LLM stages complete</b>\n\n"
-                f"Saved artifacts in <code>{job_dir}</code>\n"
-                "No final video found yet (tool stages are scaffolded)."
-            )
-        except Exception:
-            pass
+        await status_message.edit_text(
+            "✅ <b>Assembly stage completed</b>\n\n"
+            "No final MP4 found yet. Check job artifacts for details."
+        )
 
     return video_path

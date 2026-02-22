@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     base_dir: Path = Field(default=Path("."), alias="BASE_DIR")
     db_path: Path = Field(default=Path("data/assets.db"), alias="DB_PATH")
 
+    # Optional Planka routing for HITL handoff.
+    planka_base_url: str | None = Field(default=None, alias="PLANKA_BASE_URL")
+    planka_token: str | None = Field(default=None, alias="PLANKA_TOKEN")
+    planka_auth_header: str = Field(default="Authorization", alias="PLANKA_AUTH_HEADER")
+    planka_auth_prefix: str = Field(default="Bearer", alias="PLANKA_AUTH_PREFIX")
+    planka_board_id: str | None = Field(default=None, alias="PLANKA_BOARD_ID")
+    planka_ready_for_kling_list_id: str | None = Field(
+        default=None, alias="PLANKA_READY_FOR_KLING_LIST_ID"
+    )
+    planka_card_id_for_testing: str | None = Field(default=None, alias="PLANKA_CARD_ID_FOR_TESTING")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
