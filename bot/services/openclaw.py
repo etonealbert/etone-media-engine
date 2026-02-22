@@ -134,6 +134,10 @@ def _build_pipeline_payload(task_data: dict[str, Any]) -> dict[str, Any]:
                 "folder": task_data.get("avatar_folder", ""),
                 "path": task_data.get("avatar_path", ""),
                 "face_reference": f"{task_data.get('avatar_path', '').rstrip('/')}/front_medium.png",
+                "portrait_reference": f"{task_data.get('avatar_path', '').rstrip('/')}/portrait/headshot_01.png",
+                "character_profile": f"{task_data.get('avatar_path', '').rstrip('/')}/character.json",
+                "voice_reference": f"{task_data.get('avatar_path', '').rstrip('/')}/voice/voice_ref.wav",
+                "voice_profile": f"{task_data.get('avatar_path', '').rstrip('/')}/voice/voice_profile.json",
             },
             "location": {
                 "folder": task_data.get("location_folder", ""),

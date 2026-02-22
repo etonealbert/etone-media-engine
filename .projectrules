@@ -71,6 +71,16 @@ bot/                    # Main bot package
 - Flat: `b_rolls/`, `voiceovers/`, `audio_sfx/` — files directly in category dir
 - All paths in SQLite are stored **relative to project root**
 
+### Avatar Character Package (Consistency)
+- Avatar folders are character packages, not image-only folders.
+- Recommended structure per avatar folder:
+  - `front_medium.png`, `profile*.png`
+  - `portrait/headshot_01.png` (portrait reference)
+  - `voice/voice_ref.wav` (clean voice sample)
+  - `voice/voice_profile.json` (provider/voice id/style)
+  - `character.json` (persona, tone, phrases, constraints)
+- Generation pipeline should pass avatar voice + character files to subagents for cross-video consistency.
+
 ### Callback Data
 - Telegram limits callback_data to **64 bytes**
 - All CallbackData factories use short prefixes: `cat`, `fld`, `ast`, `gen`, `len`, `cfm`, `sk`, `rv`, `x`

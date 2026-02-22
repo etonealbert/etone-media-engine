@@ -54,7 +54,7 @@ async def help_handler(message: Message) -> None:
         "Drop any file into the chat and I'll ask where to save it.\n\n"
         "<b>Asset Categories:</b>\n"
         "  <b>Avatars</b> - Subfolder per avatar: <code>[ID]_[Name]_[Gender]_[Age]_[Niche]</code>\n"
-        "    Required: front_medium.png, profile.png\n"
+        "    Required: front_medium.png, profile.png, portrait/headshot_01.png, voice/voice_ref.wav, character.json\n"
         "  <b>Locations</b> - Subfolder: <code>[ID]_[Environment]_[Lighting]</code>\n"
         "    Required: wide_shot.png, medium_shot.png\n"
         "  <b>Products</b> - Subfolder: <code>[Brand]_[ProductName]</code>\n"

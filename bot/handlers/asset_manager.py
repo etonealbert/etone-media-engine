@@ -5,6 +5,7 @@ structured categories (avatars, locations, products).
 """
 
 import asyncio
+import json
 import logging
 
 from aiogram import Bot, F, Router
@@ -438,6 +439,59 @@ async def create_asset_handler(message: Message) -> None:
         if not placeholder.exists():
             placeholder.write_text(f"[PLACEHOLDER - Replace with actual {fname}]")
             placeholders_created.append(fname)
+
+    if category == "avatars":
+        portrait_dir = folder_path / "portrait"
+        voice_dir = folder_path / "voice"
+        portrait_dir.mkdir(parents=True, exist_ok=True)
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        portrait_placeholder = portrait_dir / "headshot_01.png"
+        if not portrait_placeholder.exists():
+            portrait_placeholder.write_text("[PLACEHOLDER - avatar portrait reference]")
+            placeholders_created.append("portrait/headshot_01.png")
+
+        voice_placeholder = voice_dir / "voice_ref.wav"
+        if not voice_placeholder.exists():
+            voice_placeholder.write_text("[PLACEHOLDER - clean voice sample 10-30s]")
+            placeholders_created.append("voice/voice_ref.wav")
+
+        voice_profile = voice_dir / "voice_profile.json"
+        if not voice_profile.exists():
+            voice_profile.write_text(
+                json.dumps(
+                    {
+                        "provider": "elevenlabs",
+                        "voice_id": "",
+                        "style": "confident-friendly",
+                        "language": "en",
+                        "notes": "Keep this avatar voice consistent across videos.",
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            placeholders_created.append("voice/voice_profile.json")
+
+        character_profile = folder_path / "character.json"
+        if not character_profile.exists():
+            character_profile.write_text(
+                json.dumps(
+                    {
+                        "name": "",
+                        "persona": "",
+                        "tone": "",
+                        "accent": "",
+                        "age_range": "",
+                        "niche": "",
+                        "signature_phrases": [],
+                        "avoid_phrases": [],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            placeholders_created.append("character.json")
 
     # Auto-index
     await _index_single_category(category)

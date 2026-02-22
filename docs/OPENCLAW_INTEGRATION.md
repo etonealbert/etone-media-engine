@@ -27,6 +27,16 @@ Configured in OpenClaw runtime:
 6. Albert generates video manually in Kling and sends file/link back in Telegram.
 7. Bot resumes pipeline with `assembly_manager` using Albert’s provided input.
 
+## Avatar consistency inputs
+
+When avatar assets exist, payload now includes additional avatar references:
+- `portrait_reference` (`portrait/headshot_01.png`)
+- `character_profile` (`character.json`)
+- `voice_reference` (`voice/voice_ref.wav`)
+- `voice_profile` (`voice/voice_profile.json`)
+
+These are passed to subagents to keep character identity and voice stable across videos.
+
 ## Runtime artifact layout
 
 For each job (`data/jobs/<job_id>/`):
