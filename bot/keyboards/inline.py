@@ -126,7 +126,7 @@ async def asset_list_keyboard(
     page: int = 0,
     cb_action: str = "select",
     skip_step: str = "",
-) -> InlineKeyboardMarkup:
+) -> tuple[InlineKeyboardMarkup, bool]:
     """
     Build a paginated inline keyboard of assets/folders from the DB.
     For subfolder categories: shows unique folders.
@@ -134,6 +134,10 @@ async def asset_list_keyboard(
 
     If skip_step is set, a "Skip" button is added so the user can
     proceed without selecting anything from this step.
+
+    Returns:
+        Tuple of (keyboard, has_items) — has_items is False when the
+        category is empty, so the caller can adjust the message text.
     """
     if category in SUBFOLDER_CATEGORIES:
         items = await get_unique_folders(category)
@@ -142,6 +146,7 @@ async def asset_list_keyboard(
         items = await get_assets_by_category(category)
         name_key = "file_name"
 
+    has_items = len(items) > 0
     page_items, has_prev, has_next = paginate(items, page, per_page=6)
 
     builder = InlineKeyboardBuilder()
@@ -192,7 +197,7 @@ async def asset_list_keyboard(
     rows.append(bottom_count)
     builder.adjust(*rows)
 
-    return builder.as_markup()
+    return builder.as_markup(), has_items
 
 
 def length_picker_keyboard() -> InlineKeyboardMarkup:

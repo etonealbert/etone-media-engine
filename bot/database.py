@@ -124,9 +124,10 @@ async def get_unique_folders(category: str) -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT DISTINCT folder_name, meta_id, meta_name, meta_extra
+            SELECT MIN(id) AS id, folder_name, meta_id, meta_name, meta_extra
             FROM assets
             WHERE category = ? AND folder_name IS NOT NULL
+            GROUP BY folder_name, meta_id, meta_name, meta_extra
             ORDER BY meta_id, folder_name
             """,
             (category,),

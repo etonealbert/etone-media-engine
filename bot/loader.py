@@ -11,7 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.config import settings
-from bot.handlers import asset_manager, common, generate
+from bot.handlers import asset_manager, common, generate, review
 from bot.middlewares.admin_only import AdminOnlyMiddleware
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ def create_dispatcher() -> Dispatcher:
     dp.include_router(common.router)
     dp.include_router(asset_manager.router)
     dp.include_router(generate.router)
+    dp.include_router(review.router)
 
     logger.info(
         "Dispatcher configured with %d routers, admin_id=%d",

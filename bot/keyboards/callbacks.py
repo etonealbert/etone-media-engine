@@ -56,6 +56,15 @@ class SkipCB(CallbackData, prefix="sk"):
     step: str  # "avatar", "location", "product", "task", "length", "context"
 
 
+class ReviewCB(CallbackData, prefix="rv"):
+    """Asset review browser callbacks."""
+
+    action: str  # "cat", "item", "page", "back"
+    cat: str = ""  # category key
+    id: int = 0  # DB asset id (for flat file selection)
+    page: int = 0  # pagination page number
+
+
 class CancelCB(CallbackData, prefix="x"):
     """Universal cancel callback."""
 

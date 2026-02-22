@@ -34,9 +34,9 @@ bot/                    # Main bot package
 ├── loader.py           # Bot + Dispatcher factory
 ├── database.py         # SQLite asset index (aiosqlite)
 ├── middlewares/         # AdminOnlyMiddleware (global security)
-├── handlers/           # Route handlers (common, asset_manager, generate)
+├── handlers/           # Route handlers (common, asset_manager, generate, review)
 ├── keyboards/          # InlineKeyboard builders + CallbackData factories
-├── states/             # FSM state definitions (upload, generate wizards)
+├── states/             # FSM state definitions (upload, generate, review)
 ├── services/           # Business logic (file_manager, openclaw mock)
 └── utils/              # Pagination helper
 ```
@@ -56,13 +56,18 @@ bot/                    # Main bot package
 
 ### Callback Data
 - Telegram limits callback_data to **64 bytes**
-- All CallbackData factories use short prefixes: `cat`, `fld`, `ast`, `gen`, `len`, `cfm`, `x`
+- All CallbackData factories use short prefixes: `cat`, `fld`, `ast`, `gen`, `len`, `cfm`, `sk`, `rv`, `x`
 - Use integer DB IDs in callbacks, NEVER full file paths
 
 ### FSM
 - MemoryStorage (single-admin bot, acceptable)
-- Two FSM flows: UploadStates (file categorization), GenerateStates (video wizard)
+- Three FSM flows: UploadStates (file categorization), GenerateStates (video wizard), ReviewStates (asset browser)
 - Global /cancel handler has priority (common router included first)
+
+### Empty Asset Handling
+- Generate wizard steps 1-3 check `has_items` from `asset_list_keyboard()` return value
+- When a category is empty, the step notifies the user and suggests adding assets
+- All steps are optional — the wizard always proceeds via Skip/Cancel
 
 ### Kling 3.0 Constraints
 - Max segment: 15 seconds — longer videos use chaining

@@ -81,16 +81,29 @@ async def generate_start_handler(message: Message, state: FSMContext) -> None:
     """Start the video generation wizard. Step 1: Select avatar."""
     await state.clear()
 
-    keyboard = await asset_list_keyboard("avatars", page=0, cb_action="avatar", skip_step="avatar")
+    keyboard, has_items = await asset_list_keyboard(
+        "avatars", page=0, cb_action="avatar", skip_step="avatar"
+    )
 
     await state.set_state(GenerateStates.select_avatar)
-    await message.answer(
-        "<b>Video Generation Wizard</b>\n\n"
-        "<b>Step 1/6:</b> Select an avatar\n"
-        "<i>All steps are optional — press Skip to proceed without selecting.</i>\n\n"
-        "If the list is empty, run /index first to scan your asset library.",
-        reply_markup=keyboard,
-    )
+
+    if has_items:
+        text = (
+            "<b>Video Generation Wizard</b>\n\n"
+            "<b>Step 1/6:</b> Select an avatar\n"
+            "<i>All steps are optional — press Skip to proceed without selecting.</i>"
+        )
+    else:
+        text = (
+            "<b>Video Generation Wizard</b>\n\n"
+            "<b>Step 1/6:</b> Select an avatar\n\n"
+            "⚠️ <i>No avatars in library.</i>\n"
+            "You can add assets anytime — just send a file to the bot "
+            "or use /create_asset.\n\n"
+            "Press Skip to continue without an avatar."
+        )
+
+    await message.answer(text, reply_markup=keyboard)
 
 
 # =============================================================================
@@ -109,7 +122,7 @@ async def avatar_selected_handler(
 ) -> None:
     """Handle avatar selection or pagination."""
     if callback_data.id == 0:
-        keyboard = await asset_list_keyboard(
+        keyboard, _ = await asset_list_keyboard(
             "avatars", page=callback_data.page, cb_action="avatar", skip_step="avatar"
         )
         await callback.message.edit_reply_markup(reply_markup=keyboard)
@@ -149,13 +162,23 @@ async def _go_to_step_2(callback: CallbackQuery, state: FSMContext) -> None:
     """Transition to Step 2: Location."""
     data = await state.get_data()
     await state.set_state(GenerateStates.select_location)
-    keyboard = await asset_list_keyboard(
+    keyboard, has_items = await asset_list_keyboard(
         "locations", page=0, cb_action="location", skip_step="location"
     )
 
     progress = _build_progress(data, 2)
+    if has_items:
+        step_text = "<b>Step 2/6:</b> Select a location"
+    else:
+        step_text = (
+            "<b>Step 2/6:</b> Select a location\n\n"
+            "⚠️ <i>No locations in library.</i>\n"
+            "You can add assets anytime — just send a file to the bot "
+            "or use /create_asset.\n\n"
+            "Press Skip to continue without a location."
+        )
     await callback.message.edit_text(
-        f"<b>Video Generation Wizard</b>\n\n{progress}\n<b>Step 2/6:</b> Select a location",
+        f"<b>Video Generation Wizard</b>\n\n{progress}\n{step_text}",
         reply_markup=keyboard,
     )
 
@@ -171,7 +194,7 @@ async def location_selected_handler(
 ) -> None:
     """Handle location selection or pagination."""
     if callback_data.id == 0:
-        keyboard = await asset_list_keyboard(
+        keyboard, _ = await asset_list_keyboard(
             "locations", page=callback_data.page, cb_action="location", skip_step="location"
         )
         await callback.message.edit_reply_markup(reply_markup=keyboard)
@@ -211,13 +234,23 @@ async def _go_to_step_3(callback: CallbackQuery, state: FSMContext) -> None:
     """Transition to Step 3: Product."""
     data = await state.get_data()
     await state.set_state(GenerateStates.select_product)
-    keyboard = await asset_list_keyboard(
+    keyboard, has_items = await asset_list_keyboard(
         "products", page=0, cb_action="product", skip_step="product"
     )
 
     progress = _build_progress(data, 3)
+    if has_items:
+        step_text = "<b>Step 3/6:</b> Select a product"
+    else:
+        step_text = (
+            "<b>Step 3/6:</b> Select a product\n\n"
+            "⚠️ <i>No products in library.</i>\n"
+            "You can add assets anytime — just send a file to the bot "
+            "or use /create_asset.\n\n"
+            "Press Skip to continue without a product."
+        )
     await callback.message.edit_text(
-        f"<b>Video Generation Wizard</b>\n\n{progress}\n<b>Step 3/6:</b> Select a product",
+        f"<b>Video Generation Wizard</b>\n\n{progress}\n{step_text}",
         reply_markup=keyboard,
     )
 
@@ -233,7 +266,7 @@ async def product_selected_handler(
 ) -> None:
     """Handle product selection or pagination."""
     if callback_data.id == 0:
-        keyboard = await asset_list_keyboard(
+        keyboard, _ = await asset_list_keyboard(
             "products", page=callback_data.page, cb_action="product", skip_step="product"
         )
         await callback.message.edit_reply_markup(reply_markup=keyboard)
