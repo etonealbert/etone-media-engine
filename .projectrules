@@ -1,0 +1,92 @@
+# Project Rules — etone-media-engine
+
+> This file provides LLM context for working on this codebase.
+> Read this FIRST before making any changes.
+
+## What This Project Is
+
+A Telegram bot (`@etoneMediaEngine_bot`) that serves as the human-in-the-loop
+control center for an AI-powered UGC video production pipeline. It manages
+structured media assets and orchestrates multi-agent workflows via OpenClaw
+for generating short-form video content (TikTok/Reels/Shorts).
+
+## Tech Stack
+
+- **Python 3.11+** (currently running on 3.14)
+- **aiogram 3.25+** — async Telegram Bot framework (Router-based architecture)
+- **aiosqlite** — async SQLite for asset indexing
+- **aiofiles** — non-blocking file I/O
+- **pydantic-settings** — typed config from `.env`
+- **uv** — package manager (use `uv sync` / `uv run`)
+
+## Running the Bot
+
+```bash
+uv run python -m bot
+```
+
+## Project Structure
+
+```
+bot/                    # Main bot package
+├── __main__.py         # Entry point
+├── config.py           # Settings singleton (reads .env)
+├── loader.py           # Bot + Dispatcher factory
+├── database.py         # SQLite asset index (aiosqlite)
+├── middlewares/         # AdminOnlyMiddleware (global security)
+├── handlers/           # Route handlers (common, asset_manager, generate)
+├── keyboards/          # InlineKeyboard builders + CallbackData factories
+├── states/             # FSM state definitions (upload, generate wizards)
+├── services/           # Business logic (file_manager, openclaw mock)
+└── utils/              # Pagination helper
+```
+
+## Critical Conventions
+
+### Security
+- **AdminOnlyMiddleware** is registered as outer middleware on `dp.update`
+- ADMIN_ID = 128405827 — the ONLY user allowed to interact
+- Bot token is in `.env` (gitignored), NEVER in source code
+
+### Asset Directories
+- Subfolder-based: `avatars/`, `locations/`, `products/` — each asset is a folder
+  with structured naming (see `assets/EXAMPLE.md`)
+- Flat: `b_rolls/`, `voiceovers/`, `audio_sfx/` — files directly in category dir
+- All paths in SQLite are stored **relative to project root**
+
+### Callback Data
+- Telegram limits callback_data to **64 bytes**
+- All CallbackData factories use short prefixes: `cat`, `fld`, `ast`, `gen`, `len`, `cfm`, `x`
+- Use integer DB IDs in callbacks, NEVER full file paths
+
+### FSM
+- MemoryStorage (single-admin bot, acceptable)
+- Two FSM flows: UploadStates (file categorization), GenerateStates (video wizard)
+- Global /cancel handler has priority (common router included first)
+
+### Kling 3.0 Constraints
+- Max segment: 15 seconds — longer videos use chaining
+- Requires clean dry audio for lip-sync (voiceovers/, NOT audio_sfx/)
+- Prompt structure enforced: Scene -> Character -> Action -> Camera -> Style
+- Elements/Reference API required to lock avatar facial features
+
+### Database
+- SQLite at `data/assets.db`
+- `/index` command rescans filesystem and rebuilds the index
+- Keyboards query DB, NOT filesystem (performance)
+
+## When Making Changes
+
+1. **New handler?** Create a Router, export it, include it in `loader.py`
+2. **New callback type?** Add CallbackData in `keyboards/callbacks.py` (keep prefix short)
+3. **New asset category?** Update `CATEGORIES` in `config.py`, add to keyboards
+4. **OpenClaw integration?** Replace mock in `services/openclaw.py` — payload structure is documented
+5. **Always async** — never use blocking I/O in handlers (use aiofiles, asyncio.to_thread)
+
+## Do NOT
+
+- Commit `.env`, `notes_bot_key.txt`, or any files containing secrets
+- Use blocking file operations in async handlers
+- Put full file paths in callback_data (64-byte limit)
+- Mix voiceovers and audio_sfx — Kling requires strict separation
+- Modify `planka-sync-worker/` without understanding it's a separate synchronous service

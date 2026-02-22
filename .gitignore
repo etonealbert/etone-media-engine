@@ -212,7 +212,20 @@ __marimo__/
 # Project-specific
 notes_bot_key.txt
 data/
-assets/
-output/
 *.db
 *.db-journal
+.env
+
+# Assets — ignore all real files but keep example structure via .gitkeep
+assets/avatars/*/
+assets/locations/*/
+assets/products/*/
+assets/b_rolls/*
+assets/voiceovers/*
+assets/audio_sfx/*
+!assets/**/.gitkeep
+!assets/**/EXAMPLE.md
+
+# Output
+output/videos/*
+!output/videos/.gitkeep
