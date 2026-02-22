@@ -43,6 +43,23 @@ bot/                    # Main bot package
 
 ## Critical Conventions
 
+### /generator HITL Workflow (Current)
+- `/generator` and `/generate` share the same wizard flow
+- Before launch, user must choose mode:
+  - `Fully Autonomous` is visible but **locked** (coming soon)
+  - `Human-in-the-Loop (HITL)` is active
+- Active production path:
+  1) `analyst` -> 2) `scriptwriter` -> 3) `prompt_engineer`
+  4) Pause and wait for Albert manual Kling output
+  5) Resume with `assembly_manager`
+- `video_generator` is explicitly bypassed in HITL mode
+- Prompt-engineer output (Scene -> Character -> Action -> Camera -> Style) is written into HITL handoff artifacts and used for human handoff
+
+### Planka Routing for HITL
+- After `prompt_engineer`, route card to Column 08 (`08 Ready for Kling (Albert)`) when Planka env is configured
+- Keep routing logic in orchestration service layer (`bot/services/openclaw.py`)
+- If Planka is unavailable, Telegram HITL flow must continue without failing the job
+
 ### Security
 - **AdminOnlyMiddleware** is registered as outer middleware on `dp.update`
 - ADMIN_ID = 128405827 — the ONLY user allowed to interact
