@@ -50,6 +50,12 @@ class ConfirmCB(CallbackData, prefix="cfm"):
     action: str  # "launch", "cancel"
 
 
+class SkipCB(CallbackData, prefix="sk"):
+    """Skip the current step in the wizard."""
+
+    step: str  # "avatar", "location", "product", "task", "length", "context"
+
+
 class CancelCB(CallbackData, prefix="x"):
     """Universal cancel callback."""
 

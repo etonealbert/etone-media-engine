@@ -17,6 +17,7 @@ from bot.keyboards.callbacks import (
     FolderCB,
     GenerateCB,
     LengthCB,
+    SkipCB,
 )
 from bot.utils.pagination import paginate
 
@@ -84,13 +85,12 @@ async def folder_list_keyboard(
     for folder in page_items:
         folder_name = folder.get("folder_name", "unknown")
         display = folder_name[:30] + "..." if len(folder_name) > 33 else folder_name
-        # Use a synthetic id based on folder position; we pass folder info via FSM
         builder.button(
             text=display,
             callback_data=FolderCB(
                 action="select",
                 cat=category,
-                id=hash(folder_name) % 100000,  # Short numeric reference
+                id=hash(folder_name) % 100000,
             ),
         )
 
@@ -112,7 +112,6 @@ async def folder_list_keyboard(
         callback_data=CancelCB(),
     )
 
-    # Items in 1 column, nav in a row, cancel alone
     rows = [1] * len(page_items)
     if nav_buttons:
         rows.append(len(nav_buttons))
@@ -126,11 +125,15 @@ async def asset_list_keyboard(
     category: str,
     page: int = 0,
     cb_action: str = "select",
+    skip_step: str = "",
 ) -> InlineKeyboardMarkup:
     """
     Build a paginated inline keyboard of assets/folders from the DB.
     For subfolder categories: shows unique folders.
     For flat categories: shows individual files.
+
+    If skip_step is set, a "Skip" button is added so the user can
+    proceed without selecting anything from this step.
     """
     if category in SUBFOLDER_CATEGORIES:
         items = await get_unique_folders(category)
@@ -168,15 +171,25 @@ async def asset_list_keyboard(
         )
         nav_count += 1
 
+    # Bottom row: Skip + Cancel
+    bottom_count = 0
+    if skip_step:
+        builder.button(
+            text="\u23e9 Skip",
+            callback_data=SkipCB(step=skip_step),
+        )
+        bottom_count += 1
+
     builder.button(
         text="\u274c Cancel",
         callback_data=CancelCB(),
     )
+    bottom_count += 1
 
     rows = [1] * len(page_items)
     if nav_count:
         rows.append(nav_count)
-    rows.append(1)
+    rows.append(bottom_count)
     builder.adjust(*rows)
 
     return builder.as_markup()
@@ -193,11 +206,15 @@ def length_picker_keyboard() -> InlineKeyboardMarkup:
         )
 
     builder.button(
+        text="\u23e9 Skip (default 15s)",
+        callback_data=SkipCB(step="length"),
+    )
+    builder.button(
         text="\u274c Cancel",
         callback_data=CancelCB(),
     )
 
-    builder.adjust(4, 1)
+    builder.adjust(4, 1, 1)
     return builder.as_markup()
 
 
