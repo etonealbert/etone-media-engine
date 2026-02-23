@@ -75,7 +75,9 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No valid JSON object found in agent output")
 
 
-async def _run_openclaw_agent(agent_id: str, session_id: str, prompt: str, timeout: int = 600) -> str:
+async def _run_openclaw_agent(
+    agent_id: str, session_id: str, prompt: str, timeout: int = 600
+) -> str:
     cmd = (
         f"openclaw agent --agent {shlex.quote(agent_id)} "
         f"--session-id {shlex.quote(session_id)} "
@@ -219,6 +221,13 @@ def _find_pipeline_stage(payload: dict[str, Any], agent: str) -> dict[str, Any] 
     return None
 
 
+def _set_pipeline_status(payload: dict[str, Any], agent: str, status: str) -> None:
+    """Set the status of a pipeline stage, silently skipping if not found."""
+    stage = _find_pipeline_stage(payload, agent)
+    if stage is not None:
+        stage["status"] = status
+
+
 def _planka_request(path: str, method: str = "GET", body: dict[str, Any] | None = None) -> Any:
     if not settings.planka_base_url or not settings.planka_token:
         return None
@@ -243,33 +252,157 @@ def _planka_request(path: str, method: str = "GET", body: dict[str, Any] | None 
         return json.loads(raw) if raw else None
 
 
-async def _move_planka_card_to_ready_for_kling(job_id: str, approved_payload: dict[str, Any]) -> None:
-    if not settings.planka_board_id or not settings.planka_ready_for_kling_list_id:
-        return
-
-    # card id can be provided by orchestrator callback data later; for now use explicit env mapping
-    if not settings.planka_card_id_for_testing:
-        return
-
-    card_id = settings.planka_card_id_for_testing
-
-    description = (
-        f"HITL handoff for job {job_id}\n\n"
-        "Approved generation input (prompt_engineer):\n"
-        f"```json\n{json.dumps(approved_payload, ensure_ascii=False, indent=2)}\n```"
+def _build_planka_card_description(
+    job_id: str,
+    approved_payload: dict[str, Any],
+    assets: dict[str, Any],
+) -> str:
+    """Build a concise Planka card body for HITL handoff."""
+    # Extract concise prompt summaries from approved payload
+    prompt_lines: list[str] = []
+    segments = approved_payload.get("segments", [])
+    for seg in segments[:6]:  # cap at 6 to keep card readable
+        kling = seg.get("kling_prompt", {})
+        prompt_text = (
+            kling if isinstance(kling, str) else kling.get("prompt_structure_verified", "")
+        )
+        if prompt_text:
+            sid = seg.get("segment_id", "?")
+            prompt_lines.append(f"  Seg {sid}: {prompt_text[:200]}")
+    prompt_block = (
+        "\n".join(prompt_lines)
+        if prompt_lines
+        else json.dumps(approved_payload, indent=2, ensure_ascii=False)[:600]
     )
 
-    def _sync_calls() -> None:
-        try:
-            _planka_request(
-                f"/api/cards/{card_id}",
-                method="PATCH",
-                body={"listId": settings.planka_ready_for_kling_list_id, "description": description},
-            )
-        except urllib.error.HTTPError as e:
-            logger.warning("Planka routing failed for job %s: %s", job_id, e)
+    # Asset input paths
+    avatar_path = assets.get("avatar", {}).get("path", "n/a")
+    avatar_face = assets.get("avatar", {}).get("face_reference", "")
+    avatar_portrait = assets.get("avatar", {}).get("portrait_reference", "")
+    avatar_character = assets.get("avatar", {}).get("character_profile", "")
+    avatar_voice = assets.get("avatar", {}).get("voice_reference", "")
+    avatar_voice_profile = assets.get("avatar", {}).get("voice_profile", "")
+    location_path = assets.get("location", {}).get("path", "n/a")
+    location_bg = assets.get("location", {}).get("background", "")
+    product_path = assets.get("product", {}).get("path", "n/a")
+    product_hero = assets.get("product", {}).get("hero_image", "")
 
-    await asyncio.to_thread(_sync_calls)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return (
+        f"## HITL Kling Handoff — {today}\n\n"
+        f"**Job ID:** `{job_id}`\n\n"
+        f"### Approved Prompts\n{prompt_block}\n\n"
+        f"### Asset Inputs\n"
+        f"- Avatar folder: `{avatar_path}`\n"
+        f"- Avatar face ref: `{avatar_face}`\n"
+        f"- Avatar portrait ref: `{avatar_portrait}`\n"
+        f"- Avatar character profile: `{avatar_character}`\n"
+        f"- Avatar voice ref: `{avatar_voice}`\n"
+        f"- Avatar voice profile: `{avatar_voice_profile}`\n"
+        f"- Location folder: `{location_path}`\n"
+        f"- Location background: `{location_bg}`\n"
+        f"- Product folder: `{product_path}`\n"
+        f"- Product hero image: `{product_hero}`\n\n"
+        f"### Instructions for Albert\n"
+        f"1. Use the prompts above to generate video segments in **Kling 3.0**.\n"
+        f"2. Use avatar image refs + portrait + character + voice files to keep identity/voice consistent.\n"
+        f"3. Each segment ≤ 15 s; chain if needed.\n"
+        f"4. When done, return output in Telegram bot chat for job `{job_id}` by either:\n"
+        f"   - uploading the generated video file, or\n"
+        f"   - sending a direct downloadable URL.\n"
+    )
+
+
+def _planka_create_card(name: str, list_id: str, description: str) -> Any:
+    """Try common Planka API endpoint patterns to create a card."""
+    body = {"name": name, "listId": list_id, "description": description}
+    # Planka >=1.x nests under /api/cards; older versions use /api/lists/:id/cards
+    endpoints = [
+        ("/api/cards", "POST"),
+        (f"/api/lists/{list_id}/cards", "POST"),
+    ]
+    last_err: Exception | None = None
+    for path, method in endpoints:
+        try:
+            result = _planka_request(path, method=method, body=body)
+            return result
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            last_err = exc
+            logger.debug("Planka create-card endpoint %s failed: %s", path, exc)
+            continue
+    raise RuntimeError(f"All Planka create-card endpoints failed: {last_err}")
+
+
+async def _move_planka_card_to_ready_for_kling(
+    job_id: str,
+    approved_payload: dict[str, Any],
+    assets: dict[str, Any],
+) -> None:
+    """Route a HITL card to the 'Ready for Kling' list in Planka.
+
+    If PLANKA_CARD_ID_FOR_TESTING is set, update that card (move + description).
+    Otherwise create a new card in PLANKA_READY_FOR_KLING_LIST_ID.
+    Never raises — logs warnings on failure so the pipeline continues.
+    """
+    if not settings.planka_base_url or not settings.planka_token:
+        logger.info(
+            "Planka not configured (no base_url/token) — skipping HITL card routing for job %s",
+            job_id,
+        )
+        return
+    if not settings.planka_ready_for_kling_list_id:
+        logger.info(
+            "PLANKA_READY_FOR_KLING_LIST_ID not set — skipping card routing for job %s", job_id
+        )
+        return
+
+    list_id = settings.planka_ready_for_kling_list_id  # narrowed to str above
+    description = _build_planka_card_description(job_id, approved_payload, assets)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _sync_calls() -> None:
+        card_id = settings.planka_card_id_for_testing
+        if card_id:
+            # Update existing card: move to target list and set description
+            try:
+                _planka_request(
+                    f"/api/cards/{card_id}",
+                    method="PATCH",
+                    body={
+                        "listId": list_id,
+                        "description": description,
+                    },
+                )
+                logger.info("Planka HITL handoff OK — updated card %s for job %s", card_id, job_id)
+            except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+                logger.warning(
+                    "Planka card update failed for job %s (card %s): %s", job_id, card_id, exc
+                )
+        else:
+            # Create a new card in the target list
+            card_name = f"Kling HITL — {today} — {job_id[:8]}"
+            try:
+                result = _planka_create_card(
+                    name=card_name,
+                    list_id=list_id,
+                    description=description,
+                )
+                new_id = ""
+                if isinstance(result, dict):
+                    new_id = result.get("item", {}).get("id", "") or result.get("id", "")
+                logger.info(
+                    "Planka HITL handoff OK — created card %s for job %s",
+                    new_id or "(unknown id)",
+                    job_id,
+                )
+            except Exception as exc:
+                logger.warning("Planka card creation failed for job %s: %s", job_id, exc)
+
+    try:
+        await asyncio.to_thread(_sync_calls)
+    except Exception as exc:
+        # Absolute safety net — never crash the pipeline over Planka
+        logger.error("Unexpected Planka error for job %s: %s", job_id, exc, exc_info=True)
 
 
 async def run_openclaw_agents(
@@ -280,7 +413,7 @@ async def run_openclaw_agents(
 ) -> dict[str, Any]:
     payload = _build_pipeline_payload({**task_data, "generation_mode": generation_mode})
     job_id = payload["job_id"]
-    session_id = f"video-pipeline:{job_id}"
+    session_id = f"video-pipeline_{job_id}"
 
     job_dir = _jobs_dir() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -302,31 +435,35 @@ async def run_openclaw_agents(
         )
         analyst_json = _extract_first_json_object(analyst_raw)
         analyst_path.write_text(json.dumps(analyst_json, indent=2, ensure_ascii=False))
-        _find_pipeline_stage(payload, "analyst")["status"] = "done"
+        _set_pipeline_status(payload, "analyst", "done")
 
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n✍️ Scriptwriter running...")
         script_raw = await _run_openclaw_agent(
             "scriptwriter",
             session_id,
-            _stage_prompt("scriptwriter", job_path=job_path, in_path=analyst_path, out_path=script_path),
+            _stage_prompt(
+                "scriptwriter", job_path=job_path, in_path=analyst_path, out_path=script_path
+            ),
         )
         script_json = _extract_first_json_object(script_raw)
         script_path.write_text(json.dumps(script_json, indent=2, ensure_ascii=False))
-        _find_pipeline_stage(payload, "scriptwriter")["status"] = "done"
+        _set_pipeline_status(payload, "scriptwriter", "done")
 
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🎨 Prompt Engineer running...")
         prompt_raw = await _run_openclaw_agent(
             "prompt_engineer",
             session_id,
-            _stage_prompt("prompt_engineer", job_path=job_path, in_path=script_path, out_path=prompt_path),
+            _stage_prompt(
+                "prompt_engineer", job_path=job_path, in_path=script_path, out_path=prompt_path
+            ),
         )
         prompt_json = _extract_first_json_object(prompt_raw)
         prompt_path.write_text(json.dumps(prompt_json, indent=2, ensure_ascii=False))
-        _find_pipeline_stage(payload, "prompt_engineer")["status"] = "done"
+        _set_pipeline_status(payload, "prompt_engineer", "done")
 
         if generation_mode == "hitl":
-            _find_pipeline_stage(payload, "video_generator")["status"] = "bypassed_hitl"
-            _find_pipeline_stage(payload, "assembly_manager")["status"] = "waiting_human_input"
+            _set_pipeline_status(payload, "video_generator", "bypassed_hitl")
+            _set_pipeline_status(payload, "assembly_manager", "waiting_human_input")
 
             handoff = {
                 "job_id": job_id,
@@ -339,7 +476,9 @@ async def run_openclaw_agents(
             hitl_path.write_text(json.dumps(handoff, indent=2, ensure_ascii=False))
             job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
-            await _move_planka_card_to_ready_for_kling(job_id, prompt_json)
+            await _move_planka_card_to_ready_for_kling(
+                job_id, prompt_json, payload.get("assets", {})
+            )
 
             await status_message.edit_text(
                 "⏸️ <b>Pipeline paused for HITL</b>\n\n"
@@ -410,7 +549,7 @@ async def resume_pipeline_with_human_output(
         + f"Read human Kling output manifest at: {human_input_manifest}\n"
         + "Treat video_path or video_url as the source generated footage and continue pipeline."
     )
-    session_id = f"video-pipeline:{job_id}:resume"
+    session_id = f"video-pipeline_{job_id}_resume"
     assembly_raw = await _run_openclaw_agent("assembly_manager", session_id, stage_prompt)
     try:
         assembly_json = _extract_first_json_object(assembly_raw)
@@ -425,7 +564,9 @@ async def resume_pipeline_with_human_output(
     job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     video_path = None
-    final_from_agent = assembly_json.get("final_video_path") if isinstance(assembly_json, dict) else None
+    final_from_agent = (
+        assembly_json.get("final_video_path") if isinstance(assembly_json, dict) else None
+    )
     if isinstance(final_from_agent, str) and final_from_agent.strip():
         candidate = Path(final_from_agent.strip())
         if not candidate.is_absolute():
