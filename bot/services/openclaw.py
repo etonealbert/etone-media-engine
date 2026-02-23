@@ -266,6 +266,47 @@ def _planka_request(path: str, method: str = "GET", body: dict[str, Any] | None 
         return json.loads(raw) if raw else None
 
 
+def _resolve_hitl_asset_files(assets: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Resolve concrete asset file refs into existing and missing file lists."""
+    refs: list[str] = []
+
+    avatar = assets.get("avatar", {})
+    location = assets.get("location", {})
+    product = assets.get("product", {})
+
+    if isinstance(avatar, dict):
+        refs.extend(
+            [
+                avatar.get("face_reference", ""),
+                avatar.get("portrait_reference", ""),
+                avatar.get("character_profile", ""),
+                avatar.get("voice_reference", ""),
+                avatar.get("voice_profile", ""),
+            ]
+        )
+    if isinstance(location, dict):
+        refs.append(location.get("background", ""))
+    if isinstance(product, dict):
+        refs.append(product.get("hero_image", ""))
+
+    existing: list[str] = []
+    missing: list[str] = []
+
+    for ref in refs:
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        path = Path(ref.strip())
+        if not path.is_absolute():
+            path = settings.base_dir / path
+        resolved = str(path)
+        if path.exists():
+            existing.append(resolved)
+        else:
+            missing.append(resolved)
+
+    return existing, missing
+
+
 def _build_planka_card_description(
     job_id: str,
     approved_payload: dict[str, Any],
@@ -300,6 +341,9 @@ def _build_planka_card_description(
     location_bg = assets.get("location", {}).get("background", "")
     product_path = assets.get("product", {}).get("path", "n/a")
     product_hero = assets.get("product", {}).get("hero_image", "")
+    asset_files, missing_files = _resolve_hitl_asset_files(assets)
+    asset_files_block = "\n".join(f"- `{p}`" for p in asset_files) or "- (none)"
+    missing_files_block = "\n".join(f"- `{p}`" for p in missing_files) or "- (none)"
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return (
@@ -317,6 +361,8 @@ def _build_planka_card_description(
         f"- Location background: `{location_bg}`\n"
         f"- Product folder: `{product_path}`\n"
         f"- Product hero image: `{product_hero}`\n\n"
+        f"### Resolved Asset Files\n{asset_files_block}\n\n"
+        f"### Missing Asset Files\n{missing_files_block}\n\n"
         f"### Instructions for Albert\n"
         f"1. Use the prompts above to generate video segments in **Kling 3.0**.\n"
         f"2. Use avatar image refs + portrait + character + voice files to keep identity/voice consistent.\n"
@@ -351,7 +397,7 @@ async def _move_planka_card_to_ready_for_kling(
     job_id: str,
     approved_payload: dict[str, Any],
     assets: dict[str, Any],
-) -> None:
+) -> str:
     """Route a HITL card to the 'Ready for Kling' list in Planka.
 
     If PLANKA_CARD_ID_FOR_TESTING is set, update that card (move + description).
@@ -363,18 +409,22 @@ async def _move_planka_card_to_ready_for_kling(
             "Planka not configured (no base_url/token) — skipping HITL card routing for job %s",
             job_id,
         )
-        return
+        return "planka: skipped missing config"
     if not settings.planka_ready_for_kling_list_id:
         logger.info(
             "PLANKA_READY_FOR_KLING_LIST_ID not set — skipping card routing for job %s", job_id
         )
-        return
+        return "planka: skipped missing list id"
 
     list_id = settings.planka_ready_for_kling_list_id  # narrowed to str above
-    description = _build_planka_card_description(job_id, approved_payload, assets)
+    try:
+        description = _build_planka_card_description(job_id, approved_payload, assets)
+    except Exception as exc:
+        logger.warning("Planka card description build failed for job %s: %s", job_id, exc)
+        return "planka: failed description"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def _sync_calls() -> None:
+    def _sync_calls() -> str:
         card_id = settings.planka_card_id_for_testing
         if card_id:
             # Update existing card: move to target list and set description
@@ -388,10 +438,12 @@ async def _move_planka_card_to_ready_for_kling(
                     },
                 )
                 logger.info("Planka HITL handoff OK — updated card %s for job %s", card_id, job_id)
+                return "planka: updated card"
             except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
                 logger.warning(
                     "Planka card update failed for job %s (card %s): %s", job_id, card_id, exc
                 )
+                return "planka: failed update"
         else:
             # Create a new card in the target list
             card_name = f"Kling HITL — {today} — {job_id[:8]}"
@@ -409,14 +461,17 @@ async def _move_planka_card_to_ready_for_kling(
                     new_id or "(unknown id)",
                     job_id,
                 )
+                return "planka: created card"
             except Exception as exc:
                 logger.warning("Planka card creation failed for job %s: %s", job_id, exc)
+                return "planka: failed create"
 
     try:
-        await asyncio.to_thread(_sync_calls)
+        return await asyncio.to_thread(_sync_calls)
     except Exception as exc:
         # Absolute safety net — never crash the pipeline over Planka
         logger.error("Unexpected Planka error for job %s: %s", job_id, exc, exc_info=True)
+        return "planka: failed unexpected"
 
 
 async def run_openclaw_agents(
@@ -478,28 +533,32 @@ async def run_openclaw_agents(
         if generation_mode == "hitl":
             _set_pipeline_status(payload, "video_generator", "bypassed_hitl")
             _set_pipeline_status(payload, "assembly_manager", "waiting_human_input")
+            assets = payload.get("assets", {})
+            asset_files, missing_files = _resolve_hitl_asset_files(assets)
+
+            planka_status = await _move_planka_card_to_ready_for_kling(job_id, prompt_json, assets)
 
             handoff = {
                 "job_id": job_id,
                 "status": "waiting_for_human_kling_output",
                 "ready_for_kling_column": "08 Ready for Kling (Albert)",
                 "approved_generation_input": prompt_json,
+                "asset_files": asset_files,
+                "missing_files": missing_files,
+                "planka_status": planka_status,
                 "task_summary": payload.get("task", {}),
                 "created_at": _now_iso(),
             }
             hitl_path.write_text(json.dumps(handoff, indent=2, ensure_ascii=False))
             job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
-            await _move_planka_card_to_ready_for_kling(
-                job_id, prompt_json, payload.get("assets", {})
-            )
-
             segments = prompt_json.get("segments", []) if isinstance(prompt_json, dict) else []
             await status_message.edit_text(
                 "⏸️ <b>Pipeline paused for HITL</b>\n\n"
                 f"Job: <code>{job_id}</code>\n"
                 f"Prompt package ready: <code>{len(segments)}</code> segment(s).\n"
-                f"Saved at: <code>{hitl_path}</code>\n"
+                f"Planka: <code>{planka_status}</code>\n"
+                f"Handoff file: <code>{hitl_path}</code>\n"
                 "Please generate video manually in Kling and upload the result here."
             )
             return {
