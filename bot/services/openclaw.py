@@ -44,6 +44,20 @@ def _extract_first_json_object(text: str) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
+            # OpenClaw sometimes returns wrapper payloads like:
+            # {"payloads":[{"text":"{...real json...}"}],"meta":{...}}
+            payloads = parsed.get("payloads")
+            if isinstance(payloads, list) and payloads:
+                first = payloads[0]
+                if isinstance(first, dict):
+                    payload_text = first.get("text")
+                    if isinstance(payload_text, str) and payload_text.strip().startswith("{"):
+                        try:
+                            inner = json.loads(payload_text)
+                            if isinstance(inner, dict):
+                                return inner
+                        except Exception:
+                            pass
             return parsed
     except Exception:
         pass
@@ -480,10 +494,12 @@ async def run_openclaw_agents(
                 job_id, prompt_json, payload.get("assets", {})
             )
 
+            segments = prompt_json.get("segments", []) if isinstance(prompt_json, dict) else []
             await status_message.edit_text(
                 "⏸️ <b>Pipeline paused for HITL</b>\n\n"
                 f"Job: <code>{job_id}</code>\n"
-                "Prompt package is ready.\n"
+                f"Prompt package ready: <code>{len(segments)}</code> segment(s).\n"
+                f"Saved at: <code>{hitl_path}</code>\n"
                 "Please generate video manually in Kling and upload the result here."
             )
             return {
