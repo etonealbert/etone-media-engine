@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import shlex
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -374,23 +375,143 @@ def _build_planka_card_description(
 
 
 def _planka_create_card(name: str, list_id: str, description: str) -> Any:
-    """Try common Planka API endpoint patterns to create a card."""
-    body = {"name": name, "listId": list_id, "description": description}
-    # Planka >=1.x nests under /api/cards; older versions use /api/lists/:id/cards
-    endpoints = [
-        ("/api/cards", "POST"),
-        (f"/api/lists/{list_id}/cards", "POST"),
-    ]
-    last_err: Exception | None = None
-    for path, method in endpoints:
+    """Create a card in a Planka list with required fields."""
+
+    def _collect_positions(node: Any, out: list[int]) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "position" and isinstance(value, (int, float)):
+                    out.append(int(value))
+                else:
+                    _collect_positions(value, out)
+        elif isinstance(node, list):
+            for item in node:
+                _collect_positions(item, out)
+
+    def _next_position() -> int:
+        fallback = 65536
         try:
-            result = _planka_request(path, method=method, body=body)
-            return result
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-            last_err = exc
-            logger.debug("Planka create-card endpoint %s failed: %s", path, exc)
+            cards = _planka_request(f"/api/lists/{list_id}/cards", method="GET")
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as exc:
+            logger.warning(
+                "Planka list cards fetch failed for list %s, using fallback position %s: %s",
+                list_id,
+                fallback,
+                exc,
+            )
+            return fallback
+
+        positions: list[int] = []
+        _collect_positions(cards, positions)
+        if not positions:
+            logger.info(
+                "No Planka card positions found for list %s, using fallback position %s",
+                list_id,
+                fallback,
+            )
+            return fallback
+        return max(positions) + 65536
+
+    body = {
+        "name": name,
+        "description": description,
+        "type": "project",
+        "position": _next_position(),
+    }
+    return _planka_request(f"/api/lists/{list_id}/cards", method="POST", body=body)
+
+
+def _safe_name_for_export(src: Path) -> str:
+    parts = [p for p in src.parts[-3:] if p not in ("", ".", "..")]
+    if not parts:
+        return "asset"
+    return "__".join(parts)
+
+
+def _export_hitl_input_package(
+    package_dir: Path,
+    hitl_path: Path,
+    prompt_path: Path,
+    job_path: Path,
+    asset_files: list[str],
+) -> tuple[list[str], list[str]]:
+    package_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = package_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    for src in (hitl_path, prompt_path, job_path):
+        try:
+            shutil.copy2(src, package_dir / src.name)
+        except Exception as exc:
+            logger.warning("Failed to export %s to %s: %s", src, package_dir, exc)
+
+    exported_assets: list[str] = []
+    export_errors: list[str] = []
+    for asset in asset_files:
+        src = Path(asset)
+        if not src.exists():
             continue
-    raise RuntimeError(f"All Planka create-card endpoints failed: {last_err}")
+
+        base_name = _safe_name_for_export(src)
+        dest = assets_dir / base_name
+        suffix_idx = 1
+        while dest.exists() or dest.is_symlink():
+            dest = assets_dir / f"{base_name}_{suffix_idx}"
+            suffix_idx += 1
+
+        try:
+            dest.symlink_to(src)
+        except Exception:
+            try:
+                shutil.copy2(src, dest)
+            except Exception as exc:
+                export_errors.append(f"{src} -> {dest}: {exc}")
+                logger.warning("Failed to export asset file %s to package: %s", src, exc)
+                continue
+        exported_assets.append(str(dest))
+
+    readme = package_dir / "README.txt"
+    readme.write_text(
+        "\n".join(
+            [
+                "HITL Kling input package",
+                "",
+                "Files included:",
+                "- hitl_handoff.json",
+                "- prompt_engineer_output.json",
+                "- job_payload.json",
+                "- assets/ (symlinks or copies of resolved inputs when available)",
+                "",
+                "How to provide Kling output:",
+                "1) Preferred local flow:",
+                "   - Put generated output files into ../output_waiting",
+                "2) Telegram flow:",
+                "   - Upload the generated file in bot chat, or",
+                "   - Send a direct downloadable URL in bot chat.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    return exported_assets, export_errors
+
+
+async def _best_effort_open_folder(path: Path) -> None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "xdg-open",
+            str(path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            logger.debug("xdg-open timeout for folder %s", path)
+    except FileNotFoundError:
+        logger.info("xdg-open not available; folder not opened: %s", path)
+    except Exception as exc:
+        logger.debug("Could not open folder %s with xdg-open: %s", path, exc)
 
 
 async def _move_planka_card_to_ready_for_kling(
@@ -492,6 +613,8 @@ async def run_openclaw_agents(
     script_path = job_dir / "scriptwriter_output.json"
     prompt_path = job_dir / "prompt_engineer_output.json"
     hitl_path = job_dir / "hitl_handoff.json"
+    kling_input_package_dir = job_dir / "kling_input_package"
+    output_waiting_dir = job_dir / "output_waiting"
 
     job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
@@ -535,6 +658,8 @@ async def run_openclaw_agents(
             _set_pipeline_status(payload, "assembly_manager", "waiting_human_input")
             assets = payload.get("assets", {})
             asset_files, missing_files = _resolve_hitl_asset_files(assets)
+            kling_input_package_dir.mkdir(parents=True, exist_ok=True)
+            output_waiting_dir.mkdir(parents=True, exist_ok=True)
 
             planka_status = await _move_planka_card_to_ready_for_kling(job_id, prompt_json, assets)
 
@@ -545,11 +670,34 @@ async def run_openclaw_agents(
                 "approved_generation_input": prompt_json,
                 "asset_files": asset_files,
                 "missing_files": missing_files,
+                "kling_input_package_dir": str(kling_input_package_dir),
+                "output_waiting_dir": str(output_waiting_dir),
                 "planka_status": planka_status,
                 "task_summary": payload.get("task", {}),
                 "created_at": _now_iso(),
             }
             hitl_path.write_text(json.dumps(handoff, indent=2, ensure_ascii=False))
+
+            packaged_assets, package_errors = _export_hitl_input_package(
+                package_dir=kling_input_package_dir,
+                hitl_path=hitl_path,
+                prompt_path=prompt_path,
+                job_path=job_path,
+                asset_files=asset_files,
+            )
+            handoff["packaged_asset_files"] = packaged_assets
+            handoff["package_export_errors"] = package_errors
+            hitl_path.write_text(json.dumps(handoff, indent=2, ensure_ascii=False))
+            try:
+                shutil.copy2(hitl_path, kling_input_package_dir / hitl_path.name)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to refresh packaged handoff json for job %s: %s", job_id, exc
+                )
+
+            await _best_effort_open_folder(kling_input_package_dir)
+            await _best_effort_open_folder(output_waiting_dir)
+
             job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
             segments = prompt_json.get("segments", []) if isinstance(prompt_json, dict) else []
@@ -559,13 +707,17 @@ async def run_openclaw_agents(
                 f"Prompt package ready: <code>{len(segments)}</code> segment(s).\n"
                 f"Planka: <code>{planka_status}</code>\n"
                 f"Handoff file: <code>{hitl_path}</code>\n"
-                "Please generate video manually in Kling and upload the result here."
+                f"Kling input package: <code>{kling_input_package_dir}</code>\n"
+                f"Output waiting folder: <code>{output_waiting_dir}</code>\n"
+                "Please generate video manually in Kling, then upload output here or send a direct URL."
             )
             return {
                 "status": "waiting_human",
                 "job_id": job_id,
                 "job_dir": str(job_dir),
                 "hitl_handoff_path": str(hitl_path),
+                "kling_input_package_dir": str(kling_input_package_dir),
+                "output_waiting_dir": str(output_waiting_dir),
                 "approved_generation_input": prompt_json,
             }
 
