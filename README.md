@@ -176,7 +176,7 @@ The bot enforces a structured asset architecture. Three categories use subfolder
 
 | Category | Folder Naming | Required Files |
 |----------|--------------|----------------|
-| **Avatars** | `AV01_Sarah_F_25_Fitness` | `front_medium.png` (main face ref for Kling), `profile_left.png`, `profile_right.png`, `full_body.png` |
+| **Avatars** | `AV01_Sarah_F_25_Fitness` | `front_medium.png`, `profile_left.png`, `profile_right.png`, `full_body.png`, `portrait/headshot_01.png`, `voice/voice_ref.wav`, `voice/voice_profile.json`, `character.json` |
 | **Locations** | `LOC01_ModernKitchen_MorningSun` | `wide_shot.png`, `medium_shot.png`, `close_up.png` |
 | **Products** | `Ghost_Creatine` | `product_front.png` (transparent BG), `product_side.png`, `label_flat.jpg` |
 
@@ -189,6 +189,8 @@ The bot enforces a structured asset architecture. Three categories use subfolder
 | **Audio/SFX** | `Whoosh_Fast.wav` / `Music_Phonk_Gym.mp3` | WAV or MP3, royalty-free |
 
 > **Important:** Voiceovers and Audio/SFX are strictly separated. Kling 3.0 requires clean, dry audio for lip-sync. Background music is added only during final assembly.
+
+Avatar folders are treated as full character packages (visual + voice + persona). During generation, the bot passes avatar portrait, voice profile/reference, and `character.json` into the HITL handoff payload so identity/voice remains consistent across videos.
 
 See [`assets/EXAMPLE.md`](assets/EXAMPLE.md) for full specs.
 
