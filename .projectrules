@@ -57,8 +57,13 @@ bot/                    # Main bot package
 
 ### Planka Routing for HITL
 - After `prompt_engineer`, route card to Column 08 (`08 Ready for Kling (Albert)`) when Planka env is configured
+- If `PLANKA_CARD_ID_FOR_TESTING` is set, update (PATCH) that card; otherwise create a new card in the target list
+- Card description includes job ID, approved prompts (capped at 6 segments), and full asset input paths
 - Keep routing logic in orchestration service layer (`bot/services/openclaw.py`)
-- If Planka is unavailable, Telegram HITL flow must continue without failing the job
+- Planka errors are logged but **never crash the pipeline** — Telegram HITL flow always continues
+
+### Session ID Convention
+- OpenClaw session IDs use underscores, not colons: `video-pipeline_<job_id>`, `video-pipeline_<job_id>_resume`
 
 ### Security
 - **AdminOnlyMiddleware** is registered as outer middleware on `dp.update`

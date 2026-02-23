@@ -54,13 +54,17 @@ For each job (`data/jobs/<job_id>/`):
 Primary integration file: `bot/services/openclaw.py`
 
 - `run_openclaw_agents(...)`:
+  - session ID format: `video-pipeline_<job_id>` (underscores, not colons)
   - runs first 3 LLM subagents
   - analyst stage also consumes optional strategic brief at `docs/context/analyst_market_spec_2026-02-22.txt` when present
+  - uses `_set_pipeline_status()` helper to update stage statuses (safe no-op if stage not found)
   - marks `video_generator` as `bypassed_hitl`
   - sets `assembly_manager` to `waiting_human_input`
   - writes handoff payload and returns `waiting_human`
+  - passes `payload["assets"]` to Planka card builder for full asset context
 
 - `resume_pipeline_with_human_output(...)`:
+  - session ID format: `video-pipeline_<job_id>_resume`
   - accepts manual Kling file path or URL
   - writes `human_kling_output.json`
   - calls `assembly_manager` subagent
@@ -78,11 +82,15 @@ PLANKA_AUTH_PREFIX=Bearer
 PLANKA_BOARD_ID=...
 PLANKA_READY_FOR_KLING_LIST_ID=...
 
-# temporary/testing mapping used by current implementation
+# optional — if set, the bot PATCHes this card instead of creating a new one
 PLANKA_CARD_ID_FOR_TESTING=...
 ```
 
-If Planka env is not set, bot continues normally and only performs Telegram-based HITL handoff.
+**Card routing behavior:**
+- If `PLANKA_CARD_ID_FOR_TESTING` is set: existing card is moved to the target list and its description is overwritten.
+- Otherwise: a new card is created in `PLANKA_READY_FOR_KLING_LIST_ID` (tries `/api/cards` then `/api/lists/:id/cards` for Planka version compatibility).
+- Card description includes job ID, up to 6 approved prompt summaries, and all asset input paths (avatar face/portrait/character/voice, location background, product hero image).
+- All Planka errors are caught and logged — they **never** fail the pipeline. Telegram HITL handoff always proceeds.
 
 ## Prerequisites
 
