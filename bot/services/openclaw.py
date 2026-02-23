@@ -39,6 +39,69 @@ def _jobs_dir() -> Path:
     return d
 
 
+def _safe_write_text(path: Path, content: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write text file %s: %s", path, exc)
+
+
+def _safe_write_json(path: Path, payload: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write json file %s: %s", path, exc)
+
+
+def _trace_stage_start(trace_path: Path, stage: str) -> None:
+    trace = {"updated_at": _now_iso(), "stages": {}}
+    try:
+        if trace_path.exists():
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            if not isinstance(trace, dict):
+                trace = {"updated_at": _now_iso(), "stages": {}}
+    except Exception:
+        trace = {"updated_at": _now_iso(), "stages": {}}
+
+    stages = trace.setdefault("stages", {})
+    stage_obj = stages.setdefault(stage, {})
+    stage_obj["started_at"] = _now_iso()
+    stage_obj["status"] = "running"
+    stage_obj.pop("error", None)
+    trace["updated_at"] = _now_iso()
+    _safe_write_json(trace_path, trace)
+
+
+def _trace_stage_end(trace_path: Path, stage: str, status: str, error: str | None = None) -> None:
+    trace = {"updated_at": _now_iso(), "stages": {}}
+    try:
+        if trace_path.exists():
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            if not isinstance(trace, dict):
+                trace = {"updated_at": _now_iso(), "stages": {}}
+    except Exception:
+        trace = {"updated_at": _now_iso(), "stages": {}}
+
+    stages = trace.setdefault("stages", {})
+    stage_obj = stages.setdefault(stage, {})
+    if "started_at" not in stage_obj:
+        stage_obj["started_at"] = _now_iso()
+    stage_obj["ended_at"] = _now_iso()
+    stage_obj["status"] = status
+    if error:
+        stage_obj["error"] = error[:1000]
+    trace["updated_at"] = _now_iso()
+    _safe_write_json(trace_path, trace)
+
+
+def _write_stage_logs(stage_logs_dir: Path, stage: str, raw_text: str, parsed: dict[str, Any] | None) -> None:
+    _safe_write_text(stage_logs_dir / f"{stage}.raw.txt", raw_text)
+    if parsed is not None:
+        _safe_write_json(stage_logs_dir / f"{stage}.parsed.json", parsed)
+
+
 def _extract_first_json_object(text: str) -> dict[str, Any]:
     text = text.strip()
 
@@ -615,21 +678,32 @@ async def run_openclaw_agents(
     hitl_path = job_dir / "hitl_handoff.json"
     kling_input_package_dir = job_dir / "kling_input_package"
     output_waiting_dir = job_dir / "output_waiting"
+    stage_logs_dir = job_dir / "stage_logs"
+    trace_path = job_dir / "trace.json"
 
-    job_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    _safe_write_json(job_path, payload)
+    stage_logs_dir.mkdir(parents=True, exist_ok=True)
+    _safe_write_json(trace_path, {"job_id": job_id, "updated_at": _now_iso(), "stages": {}})
 
+    current_stage = "pipeline"
     try:
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🔍 Analyst running...")
+        current_stage = "analyst"
+        _trace_stage_start(trace_path, current_stage)
         analyst_raw = await _run_openclaw_agent(
             "analyst",
             session_id,
             _stage_prompt("analyst", job_path=job_path, in_path=None, out_path=analyst_path),
         )
         analyst_json = _extract_first_json_object(analyst_raw)
-        analyst_path.write_text(json.dumps(analyst_json, indent=2, ensure_ascii=False))
+        _safe_write_json(analyst_path, analyst_json)
+        _write_stage_logs(stage_logs_dir, "analyst", analyst_raw, analyst_json)
+        _trace_stage_end(trace_path, current_stage, "done")
         _set_pipeline_status(payload, "analyst", "done")
 
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n✍️ Scriptwriter running...")
+        current_stage = "scriptwriter"
+        _trace_stage_start(trace_path, current_stage)
         script_raw = await _run_openclaw_agent(
             "scriptwriter",
             session_id,
@@ -638,10 +712,14 @@ async def run_openclaw_agents(
             ),
         )
         script_json = _extract_first_json_object(script_raw)
-        script_path.write_text(json.dumps(script_json, indent=2, ensure_ascii=False))
+        _safe_write_json(script_path, script_json)
+        _write_stage_logs(stage_logs_dir, "scriptwriter", script_raw, script_json)
+        _trace_stage_end(trace_path, current_stage, "done")
         _set_pipeline_status(payload, "scriptwriter", "done")
 
         await status_message.edit_text("🎬 <b>Pipeline</b>\n\n🎨 Prompt Engineer running...")
+        current_stage = "prompt_engineer"
+        _trace_stage_start(trace_path, current_stage)
         prompt_raw = await _run_openclaw_agent(
             "prompt_engineer",
             session_id,
@@ -650,7 +728,9 @@ async def run_openclaw_agents(
             ),
         )
         prompt_json = _extract_first_json_object(prompt_raw)
-        prompt_path.write_text(json.dumps(prompt_json, indent=2, ensure_ascii=False))
+        _safe_write_json(prompt_path, prompt_json)
+        _write_stage_logs(stage_logs_dir, "prompt_engineer", prompt_raw, prompt_json)
+        _trace_stage_end(trace_path, current_stage, "done")
         _set_pipeline_status(payload, "prompt_engineer", "done")
 
         if generation_mode == "hitl":
@@ -705,6 +785,8 @@ async def run_openclaw_agents(
                 "⏸️ <b>Pipeline paused for HITL</b>\n\n"
                 f"Job: <code>{job_id}</code>\n"
                 f"Prompt package ready: <code>{len(segments)}</code> segment(s).\n"
+                f"Stage logs: <code>{stage_logs_dir}</code>\n"
+                f"Trace: <code>{trace_path}</code>\n"
                 f"Planka: <code>{planka_status}</code>\n"
                 f"Handoff file: <code>{hitl_path}</code>\n"
                 f"Kling input package: <code>{kling_input_package_dir}</code>\n"
@@ -726,11 +808,14 @@ async def run_openclaw_agents(
 
     except Exception as e:
         logger.exception("OpenClaw pipeline failed")
-        (job_dir / "error.txt").write_text(str(e))
+        _safe_write_text(job_dir / "error.txt", str(e))
+        _trace_stage_end(trace_path, current_stage, "failed", str(e))
         try:
             await status_message.edit_text(
                 f"❌ <b>Pipeline failed</b>\n\n<code>{str(e)[:1200]}</code>\n\n"
-                f"Job folder: <code>{job_dir}</code>"
+                f"Job folder: <code>{job_dir}</code>\n"
+                f"Stage logs: <code>{stage_logs_dir}</code>\n"
+                f"Trace: <code>{trace_path}</code>"
             )
         except Exception:
             pass
@@ -770,6 +855,10 @@ async def resume_pipeline_with_human_output(
 
     await status_message.edit_text("🎞️ <b>Assembly Manager running...</b>")
 
+    stage_logs_dir = job_dir / "stage_logs"
+    trace_path = job_dir / "trace.json"
+    stage_logs_dir.mkdir(parents=True, exist_ok=True)
+
     stage_prompt = (
         _stage_prompt("assembly_manager", job_path, prompt_path, assembly_out)
         + "\n"
@@ -777,12 +866,15 @@ async def resume_pipeline_with_human_output(
         + "Treat video_path or video_url as the source generated footage and continue pipeline."
     )
     session_id = f"video-pipeline_{job_id}_resume"
+    _trace_stage_start(trace_path, "assembly_manager")
     assembly_raw = await _run_openclaw_agent("assembly_manager", session_id, stage_prompt)
     try:
         assembly_json = _extract_first_json_object(assembly_raw)
     except Exception:
         assembly_json = {"raw": assembly_raw}
-    assembly_out.write_text(json.dumps(assembly_json, indent=2, ensure_ascii=False))
+    _safe_write_json(assembly_out, assembly_json)
+    _write_stage_logs(stage_logs_dir, "assembly_manager", assembly_raw, assembly_json)
+    _trace_stage_end(trace_path, "assembly_manager", "done")
 
     stage = _find_pipeline_stage(payload, "assembly_manager")
     if stage:
