@@ -71,7 +71,11 @@ async def _watch_output_waiting_and_resume(job_id: str, chat_id: int, bot: Bot) 
                 )
                 if video_path and video_path.exists():
                     video_file = FSInputFile(str(video_path), filename=video_path.name)
-                    await bot.send_video(chat_id=chat_id, video=video_file, caption="🔥 Final video ready!")
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=video_file,
+                        caption="🔥 Final video ready! (sent as file, no Telegram recompression)",
+                    )
                 return
 
             await asyncio.sleep(10)
@@ -731,7 +735,11 @@ async def hitl_media_received_handler(message: Message, state: FSMContext, bot: 
 
     if video_path and video_path.exists():
         video_file = FSInputFile(str(video_path), filename=video_path.name)
-        await bot.send_video(chat_id=message.chat.id, video=video_file, caption="🔥 Final video ready!")
+        await bot.send_document(
+            chat_id=message.chat.id,
+            document=video_file,
+            caption="🔥 Final video ready! (sent as file, no Telegram recompression)",
+        )
 
     await state.clear()
 
