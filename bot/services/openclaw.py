@@ -105,9 +105,11 @@ def _write_stage_logs(
 
 
 def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, Any]:
-    """Normalize prompt_engineer output so each segment has explicit per-shot prompts.
+    """Normalize prompt_engineer output with adaptive single-shot/multishot support.
 
-    If a segment has no `shots`, synthesize a single shot from kling prompt text.
+    - Single-shot is valid when `multi_shot` is false.
+    - Multishot should include explicit `shots[]` timing.
+    If missing, synthesize a safe single shot.
     """
     segments = prompt_json.get("segments")
     if not isinstance(segments, list):
@@ -132,6 +134,7 @@ def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, A
                 shot.setdefault("start_s", cursor)
                 cursor += dur
                 shot.setdefault("end_s", cursor)
+            seg.setdefault("multi_shot", len(shots) > 1)
             continue
 
         kling = seg.get("kling_prompt", {})
@@ -420,11 +423,13 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
         )
     elif stage == "prompt_engineer":
         spec = (
-            "You are prompt_engineer. Produce multishot-ready Kling package JSON: {segments:[...]}\n"
-            "Each segment must include: segment_id,duration_seconds,multi_shot,shots,kling_prompt,elements_config,generation_params,negative_prompt.\n"
-            "Each shot object must include: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
-            "Constraints: duration_seconds per segment <=15; each shot duration_seconds >=3; shot timings must be sequential and sum to segment duration.\n"
-            "Use clean scene separation with explicit transition logic (hard_cut/rack_focus/pan etc) to avoid morphing.\n"
+            "You are prompt_engineer. Produce Kling package JSON: {segments:[...]}\n"
+            "Each segment must include: segment_id,duration_seconds,multi_shot,kling_prompt,elements_config,generation_params,negative_prompt.\n"
+            "If multi_shot=true, include shots[] where each shot has: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
+            "If multi_shot=false, one-shot segment is valid (shots[] optional but recommended with one shot object).\n"
+            "Guidance: prefer multi_shot for most ads (especially >10s or multiple beats like problem->solution->payoff), but allow single-shot when concept is simple.\n"
+            "Constraints: duration_seconds per segment <=15; when shots[] present, shot timings must be sequential and sum to segment duration.\n"
+            "Use explicit transition logic (hard_cut/rack_focus/pan etc) to avoid morphing in multi-shot flows.\n"
             "kling_prompt.prompt_structure_verified must be exactly 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'.\n"
             "Keep product/brand consistency and avatar consistency references in prompts."
         )
