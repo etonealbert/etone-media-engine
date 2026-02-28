@@ -109,7 +109,9 @@ def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, A
 
     - Single-shot is valid when `multi_shot` is false.
     - Multishot should include explicit `shots[]` timing.
-    If missing, synthesize a safe single shot.
+    - Enforce shot minimums (>=3s) and sequential timing.
+    - For 15s ad segments with multi-shot, normalize cumulative shot duration to exactly 15s.
+    If missing, synthesize a safe default package.
     """
     segments = prompt_json.get("segments")
     if not isinstance(segments, list):
@@ -119,38 +121,103 @@ def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, A
         if not isinstance(seg, dict):
             continue
         seg_duration = int(seg.get("duration_seconds", 15) or 15)
+        seg["duration_seconds"] = seg_duration
+
+        # Optional default negative prompt for stability.
+        seg.setdefault(
+            "negative_prompt",
+            "flickering shadows, warped text, melting objects, inconsistent label, deformed hands",
+        )
+
         shots = seg.get("shots")
-        if isinstance(shots, list) and shots:
-            # ensure basic timing fields exist
-            cursor = 0
-            for i, shot in enumerate(shots, start=1):
-                if not isinstance(shot, dict):
-                    continue
-                dur = int(shot.get("duration_seconds", 0) or 0)
-                if dur <= 0:
-                    dur = 3 if i < len(shots) else max(3, seg_duration - cursor)
-                shot["duration_seconds"] = dur
-                shot.setdefault("shot_id", i)
-                shot.setdefault("start_s", cursor)
-                cursor += dur
-                shot.setdefault("end_s", cursor)
-            seg.setdefault("multi_shot", len(shots) > 1)
+        multi_shot = bool(seg.get("multi_shot"))
+
+        # Synthesize defaults when missing.
+        if not isinstance(shots, list) or not shots:
+            kling = seg.get("kling_prompt", {})
+            base_prompt = kling if isinstance(kling, str) else kling.get("prompt_structure_verified", "")
+            if multi_shot and seg_duration >= 15:
+                # Default 3-phase split for product ads.
+                shots = [
+                    {
+                        "shot_id": 1,
+                        "duration_seconds": 3,
+                        "transition": "hard_cut",
+                        "camera": "Dolly Push-In",
+                        "prompt": f"<<<image_1>>> in problem state. {base_prompt}",
+                    },
+                    {
+                        "shot_id": 2,
+                        "duration_seconds": 4,
+                        "transition": "Cut to",
+                        "camera": "Rack Focus",
+                        "prompt": f"Cut to <<<image_1>>> presenting <<<image_2>>> solution. {base_prompt}",
+                    },
+                    {
+                        "shot_id": 3,
+                        "duration_seconds": 8,
+                        "transition": "Cut to",
+                        "camera": "Orbit Shot",
+                        "prompt": f"Cut to payoff with <<<image_1>>> and <<<image_2>>>. {base_prompt}",
+                    },
+                ]
+            else:
+                shots = [
+                    {
+                        "shot_id": 1,
+                        "duration_seconds": seg_duration,
+                        "transition": "hard_cut",
+                        "camera": "medium selfie style",
+                        "prompt": base_prompt or "Product-focused shot with clear avatar consistency",
+                    }
+                ]
+                seg["multi_shot"] = False
+            seg["shots"] = shots
+
+        # Normalize timing / minimums.
+        shots = [sh for sh in seg.get("shots", []) if isinstance(sh, dict)]
+        if not shots:
             continue
 
-        kling = seg.get("kling_prompt", {})
-        base_prompt = kling if isinstance(kling, str) else kling.get("prompt_structure_verified", "")
-        seg["shots"] = [
-            {
-                "shot_id": 1,
-                "start_s": 0,
-                "end_s": seg_duration,
-                "duration_seconds": seg_duration,
-                "transition": "hard_cut",
-                "camera": "medium selfie style",
-                "prompt": base_prompt or "Product-focused shot with clear avatar consistency",
-            }
-        ]
-        seg["multi_shot"] = False
+        for i, sh in enumerate(shots, start=1):
+            sh.setdefault("shot_id", i)
+            dur = int(sh.get("duration_seconds", 0) or 0)
+            sh["duration_seconds"] = max(3, dur) if len(shots) > 1 else max(1, dur or seg_duration)
+
+        # Target total
+        target_total = 15 if (seg.get("multi_shot") and seg_duration == 15) else seg_duration
+        current_total = sum(int(sh.get("duration_seconds", 0) or 0) for sh in shots)
+        if current_total <= 0:
+            current_total = len(shots) * 3
+
+        # Adjust last shot to match target total exactly.
+        delta = target_total - current_total
+        shots[-1]["duration_seconds"] = max(3 if len(shots) > 1 else 1, int(shots[-1]["duration_seconds"]) + delta)
+
+        # If still off due to min-floor, distribute from earlier shots.
+        current_total = sum(int(sh.get("duration_seconds", 0) or 0) for sh in shots)
+        if current_total != target_total and len(shots) > 1:
+            overflow = current_total - target_total
+            if overflow > 0:
+                for sh in reversed(shots[:-1]):
+                    take = min(overflow, int(sh["duration_seconds"]) - 3)
+                    if take > 0:
+                        sh["duration_seconds"] = int(sh["duration_seconds"]) - take
+                        overflow -= take
+                    if overflow <= 0:
+                        break
+                shots[-1]["duration_seconds"] = max(3, int(shots[-1]["duration_seconds"]) - max(0, overflow))
+
+        # Recompute start/end timeline.
+        cursor = 0
+        for sh in shots:
+            d = int(sh["duration_seconds"])
+            sh["start_s"] = cursor
+            cursor += d
+            sh["end_s"] = cursor
+
+        seg["shots"] = shots
+        seg["multi_shot"] = len(shots) > 1 if seg.get("multi_shot") is None else bool(seg.get("multi_shot"))
 
     return prompt_json
 
@@ -413,30 +480,30 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
         )
     elif stage == "scriptwriter":
         spec = (
-            "You are scriptwriter. Your ONLY job is to write a short-form UGC video script that "
-            "advertises the CONSUMER PRODUCT from the analyst output to end consumers.\n"
-            "Produce timed UGC JSON with keys: title,total_duration_seconds,segments,"
-            "voiceover_instructions. Each segment <=15 seconds and has segment_id,duration_seconds,"
-            "spoken_text,visual_direction,emotion.\n"
+            "You are scriptwriter. Your ONLY job is to write a consumer-facing 15-second product ad script.\n"
+            "Output JSON with keys: title,total_duration_seconds,segments,voiceover_instructions.\n"
+            "Each segment has: segment_id,duration_seconds,spoken_text,visual_direction,emotion.\n"
             "CRITICAL CONSTRAINTS:\n"
-            "- The script is a consumer-facing product ad (TikTok/Reels/Shorts style).\n"
-            "- spoken_text must sound like a real person recommending the PRODUCT to viewers.\n"
-            "- title must reference the product, never an agency or service.\n"
-            "- NEVER use agency/service language: 'studio', 'we build creatives', 'CTR', 'CPA', "
-            "'variants', 'campaign services', 'agency', 'our team', 'creative services'.\n"
-            "- You are writing ad copy for consumers, NOT a pitch deck for brand clients."
+            "- Product-centric only; never agency/service framing.\n"
+            "- Enforce Shot-Scene Pivot pacing across 15s: Hook(0-3s), Solution(3-7s), Payoff(7-15s).\n"
+            "- In visual_direction, explicitly state scene pivots using the phrase 'Cut to' between phases to force latent refresh.\n"
+            "- Use radical location/lighting contrast per phase (e.g., dim dramatic problem -> clean sun-drenched solution).\n"
+            "- Spoken text must sell the product to end users, not discuss ad performance metrics/services.\n"
+            "- Forbidden language: studio, agency, we build creatives, CTR/CPA, variants, campaign services."
         )
     elif stage == "prompt_engineer":
         spec = (
-            "You are prompt_engineer. Produce Kling package JSON: {segments:[...]}\n"
-            "Each segment must include: segment_id,duration_seconds,multi_shot,kling_prompt,elements_config,generation_params,negative_prompt.\n"
-            "If multi_shot=true, include shots[] where each shot has: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
-            "If multi_shot=false, one-shot segment is valid (shots[] optional but recommended with one shot object).\n"
-            "Guidance: prefer multi_shot for most ads (especially >10s or multiple beats like problem->solution->payoff), but allow single-shot when concept is simple.\n"
-            "Constraints: duration_seconds per segment <=15; when shots[] present, shot timings must be sequential and sum to segment duration.\n"
-            "Use explicit transition logic (hard_cut/rack_focus/pan etc) to avoid morphing in multi-shot flows.\n"
-            "kling_prompt.prompt_structure_verified must be exactly 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'.\n"
-            "Keep product/brand consistency and avatar consistency references in prompts."
+            "You are prompt_engineer. Produce Kling 3.0 Custom Multi-Shot JSON: {segments:[...]}\n"
+            "Each segment includes: segment_id,duration_seconds,multi_shot,kling_prompt,elements_config,generation_params,negative_prompt,shots.\n"
+            "For product ads, default to multi_shot with Shot-Scene Pivot strategy unless concept is explicitly single-shot.\n"
+            "shots[] schema: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
+            "Camera vocabulary must use cinematic terms (e.g., Dolly Push-In, Orbit Shot, Rack Focus, Slow Pull-Back).\n"
+            "Every shot prompt must include element tags for subject binding: <<<image_1>>> (creator), <<<image_2>>> (product).\n"
+            "Every shot prompt must include grounding/materiality (ground plane + materials, e.g., grey marble surface, blue plastic jar).\n"
+            "Append mandatory negative prompt to ALL segments to block: flickering shadows, warped text, melting objects.\n"
+            "Hard constraints: total segment duration <=15s; if using 15s product ad timeline, cumulative shot durations must equal exactly 15.0s; each shot >=3.0s.\n"
+            "Use explicit 'Cut to' transitions between major phases to avoid morphing.\n"
+            "kling_prompt.prompt_structure_verified must be exactly 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'."
         )
     else:
         spec = (
