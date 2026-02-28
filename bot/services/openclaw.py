@@ -476,6 +476,8 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
             "- ALL output must be consumer-facing ad copy perspective (viewer = potential buyer).\n"
             "- NEVER use agency/service language: 'studio', 'we build creatives', 'CTR', 'CPA', "
             "'variants', 'campaign services', 'agency', 'our team', 'creative services'.\n"
+            "- If task description includes a URL, use `agent-browser` to inspect the page and extract factual product details before finalizing analysis.\n"
+            "- Base hooks/objections on visible page evidence; if browsing fails, explicitly reduce confidence.\n"
             "- You are writing about a PRODUCT the viewer might buy, not a service a brand might hire."
         )
     elif stage == "scriptwriter":
