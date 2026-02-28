@@ -104,6 +104,54 @@ def _write_stage_logs(
         _safe_write_json(stage_logs_dir / f"{stage}.parsed.json", parsed)
 
 
+def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, Any]:
+    """Normalize prompt_engineer output so each segment has explicit per-shot prompts.
+
+    If a segment has no `shots`, synthesize a single shot from kling prompt text.
+    """
+    segments = prompt_json.get("segments")
+    if not isinstance(segments, list):
+        return prompt_json
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_duration = int(seg.get("duration_seconds", 15) or 15)
+        shots = seg.get("shots")
+        if isinstance(shots, list) and shots:
+            # ensure basic timing fields exist
+            cursor = 0
+            for i, shot in enumerate(shots, start=1):
+                if not isinstance(shot, dict):
+                    continue
+                dur = int(shot.get("duration_seconds", 0) or 0)
+                if dur <= 0:
+                    dur = 3 if i < len(shots) else max(3, seg_duration - cursor)
+                shot["duration_seconds"] = dur
+                shot.setdefault("shot_id", i)
+                shot.setdefault("start_s", cursor)
+                cursor += dur
+                shot.setdefault("end_s", cursor)
+            continue
+
+        kling = seg.get("kling_prompt", {})
+        base_prompt = kling if isinstance(kling, str) else kling.get("prompt_structure_verified", "")
+        seg["shots"] = [
+            {
+                "shot_id": 1,
+                "start_s": 0,
+                "end_s": seg_duration,
+                "duration_seconds": seg_duration,
+                "transition": "hard_cut",
+                "camera": "medium selfie style",
+                "prompt": base_prompt or "Product-focused shot with clear avatar consistency",
+            }
+        ]
+        seg["multi_shot"] = False
+
+    return prompt_json
+
+
 # Forbidden service/agency language patterns (case-insensitive).
 # These indicate agent drift toward promoting a UGC agency/service
 # instead of the selected consumer product.
@@ -325,18 +373,20 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
     if in_path:
         base.insert(1, f"Read previous stage output at: {in_path}")
 
-    # Optional scriptwriter research context for hooks/retention style
-    if stage == "scriptwriter":
+    # Optional strategy research context for scriptwriter/prompt_engineer
+    if stage in {"scriptwriter", "prompt_engineer"}:
         _research_paths = [
             Path("/home/etonealbert/.openclaw/subagents/Short-Form Content Strategy Framework.txt"),
             settings.base_dir / "docs" / "context" / "short_form_content_strategy_framework.txt",
+            Path("/home/etonealbert/Downloads/Kling 3.0 Multishot Ad Guide.txt"),
+            settings.base_dir / "docs" / "context" / "kling_3_multishot_ad_guide.txt",
         ]
         for rp in _research_paths:
             if rp.exists():
                 base.insert(
                     1,
-                    f"Read research context for hooks/retention style at: {rp}\n"
-                    "Use its techniques while keeping ALL content strictly about the consumer product.",
+                    f"Read research context for hooks/retention and multishot prompt quality at: {rp}\n"
+                    "Use techniques for structure and retention while keeping ALL content strictly product-centric.",
                 )
                 break
 
@@ -370,9 +420,13 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
         )
     elif stage == "prompt_engineer":
         spec = (
-            "You are prompt_engineer. Produce JSON: {segments:[...]} where each segment has segment_id,kling_prompt,"
-            "elements_config,generation_params. kling_prompt.prompt_structure_verified must be exactly"
-            " 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'."
+            "You are prompt_engineer. Produce multishot-ready Kling package JSON: {segments:[...]}\n"
+            "Each segment must include: segment_id,duration_seconds,multi_shot,shots,kling_prompt,elements_config,generation_params,negative_prompt.\n"
+            "Each shot object must include: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
+            "Constraints: duration_seconds per segment <=15; each shot duration_seconds >=3; shot timings must be sequential and sum to segment duration.\n"
+            "Use clean scene separation with explicit transition logic (hard_cut/rack_focus/pan etc) to avoid morphing.\n"
+            "kling_prompt.prompt_structure_verified must be exactly 'Scene:... -> Character:... -> Action:... -> Camera:... -> Style:...'.\n"
+            "Keep product/brand consistency and avatar consistency references in prompts."
         )
     else:
         spec = (
@@ -821,6 +875,7 @@ async def run_openclaw_agents(
             ),
         )
         prompt_json = _extract_first_json_object(prompt_raw)
+        prompt_json = _ensure_multishot_prompt_package(prompt_json)
         _safe_write_json(prompt_path, prompt_json)
         _write_stage_logs(stage_logs_dir, "prompt_engineer", prompt_raw, prompt_json)
         _trace_stage_end(trace_path, current_stage, "done")

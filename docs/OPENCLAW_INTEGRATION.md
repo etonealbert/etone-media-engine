@@ -57,8 +57,13 @@ Primary integration file: `bot/services/openclaw.py`
   - session ID format: `video-pipeline_<job_id>` (underscores, not colons)
   - runs first 3 LLM subagents
   - analyst stage also consumes optional strategic brief at `docs/context/analyst_market_spec_2026-02-22.txt` when present
-  - scriptwriter stage can consume optional strategy research at `docs/context/short_form_content_strategy_framework.txt` (fallback: `/home/etonealbert/.openclaw/subagents/Short-Form Content Strategy Framework.txt`)
+  - scriptwriter/prompt_engineer stages can consume optional strategy research at:
+    - `docs/context/short_form_content_strategy_framework.txt`
+    - `/home/etonealbert/.openclaw/subagents/Short-Form Content Strategy Framework.txt`
+    - `docs/context/kling_3_multishot_ad_guide.txt`
+    - `/home/etonealbert/Downloads/Kling 3.0 Multishot Ad Guide.txt`
   - analyst/scriptwriter outputs are validated to block agency/service-language drift and force product-centric ad copy
+  - prompt_engineer output is normalized to multishot package format (`shots[]` with per-shot durations/timings) for better Kling 3.0 consistency
   - uses `_set_pipeline_status()` helper to update stage statuses (safe no-op if stage not found)
   - marks `video_generator` as `bypassed_hitl`
   - sets `assembly_manager` to `waiting_human_input`
