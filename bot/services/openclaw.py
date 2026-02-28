@@ -104,6 +104,14 @@ def _write_stage_logs(
         _safe_write_json(stage_logs_dir / f"{stage}.parsed.json", parsed)
 
 
+_PRODUCT_IDENTITY_LOCK_BLOCK = (
+    "Product lock: <<<image_2>>> is the canonical product reference. "
+    "Keep exact same product across all shots: same label text/typography, logo placement, "
+    "blue color tone, jar+cap geometry, proportions, and material finish. "
+    "Do not redesign, relabel, recolor, or morph the product."
+)
+
+
 def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, Any]:
     """Normalize prompt_engineer output with adaptive single-shot/multishot support.
 
@@ -126,7 +134,8 @@ def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, A
         # Optional default negative prompt for stability.
         seg.setdefault(
             "negative_prompt",
-            "flickering shadows, warped text, melting objects, inconsistent label, deformed hands",
+            "flickering shadows, warped text, melting objects, inconsistent label, deformed hands, "
+            "morphing colors, product redesign, logo drift, label drift",
         )
 
         shots = seg.get("shots")
@@ -215,6 +224,12 @@ def _ensure_multishot_prompt_package(prompt_json: dict[str, Any]) -> dict[str, A
             sh["start_s"] = cursor
             cursor += d
             sh["end_s"] = cursor
+
+            # Mandatory product identity lock block in every shot prompt.
+            shot_prompt = sh.get("prompt", "")
+            if isinstance(shot_prompt, str):
+                if _PRODUCT_IDENTITY_LOCK_BLOCK not in shot_prompt:
+                    sh["prompt"] = (shot_prompt.strip() + "\n\n" + _PRODUCT_IDENTITY_LOCK_BLOCK).strip()
 
         seg["shots"] = shots
         seg["multi_shot"] = len(shots) > 1 if seg.get("multi_shot") is None else bool(seg.get("multi_shot"))
@@ -501,6 +516,7 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
             "shots[] schema: shot_id,start_s,end_s,duration_seconds,transition,camera,prompt.\n"
             "Camera vocabulary must use cinematic terms (e.g., Dolly Push-In, Orbit Shot, Rack Focus, Slow Pull-Back).\n"
             "Every shot prompt must include element tags for subject binding: <<<image_1>>> (creator), <<<image_2>>> (product).\n"
+            "Mandatory product identity lock in EVERY shot: exact same <<<image_2>>> product (label text/logo/color/shape/proportions/material), no redesign or drift.\n"
             "Every shot prompt must include grounding/materiality (ground plane + materials, e.g., grey marble surface, blue plastic jar).\n"
             "Append mandatory negative prompt to ALL segments to block: flickering shadows, warped text, melting objects.\n"
             "Hard constraints: total segment duration <=15s; if using 15s product ad timeline, cumulative shot durations must equal exactly 15.0s; each shot >=3.0s.\n"
