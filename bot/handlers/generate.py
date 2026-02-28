@@ -11,6 +11,7 @@ generation with whatever data was provided. Steps:
   7. Confirm and launch
 """
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -37,6 +38,49 @@ router = Router(name="generate")
 # Default values for skipped steps
 SKIP_MARKER = "\u2014"  # em dash, shown in summary for skipped fields
 DEFAULT_LENGTH = 15
+
+# Background watchers for auto-resume from output_waiting folder
+_HITL_WATCHERS: dict[str, asyncio.Task] = {}
+
+
+async def _watch_output_waiting_and_resume(job_id: str, chat_id: int, bot: Bot) -> None:
+    """Poll output_waiting folder and auto-resume when a video file appears."""
+    folder = Path("data/jobs") / job_id / "output_waiting"
+    exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+    try:
+        for _ in range(360):  # ~60 minutes at 10s polling
+            if not folder.exists():
+                await asyncio.sleep(10)
+                continue
+
+            candidates = [
+                p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in exts and not p.name.startswith('.')
+            ]
+            if candidates:
+                latest = max(candidates, key=lambda p: p.stat().st_mtime)
+                status_msg = await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📂 Detected file in output_waiting: <code>{latest.name}</code>. Resuming pipeline...",
+                )
+                video_path = await resume_pipeline_with_human_output(
+                    job_id=job_id,
+                    human_video_path=str(latest),
+                    human_video_url=None,
+                    status_message=status_msg,
+                )
+                if video_path and video_path.exists():
+                    video_file = FSInputFile(str(video_path), filename=video_path.name)
+                    await bot.send_video(chat_id=chat_id, video=video_file, caption="🔥 Final video ready!")
+                return
+
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.warning("output_waiting watcher failed for job %s: %s", job_id, e)
+    finally:
+        _HITL_WATCHERS.pop(job_id, None)
 
 
 # =============================================================================
@@ -599,15 +643,26 @@ async def launch_handler(
 
     if result.get("status") == "waiting_human":
         job_id = result.get("job_id", "")
+        output_waiting_dir = result.get("output_waiting_dir", "")
         await state.set_state(GenerateStates.wait_human_kling_output)
-        await state.update_data(job_id=job_id)
+        await state.update_data(job_id=job_id, output_waiting_dir=output_waiting_dir)
+
+        # Start/replace folder watcher for auto-resume.
+        old = _HITL_WATCHERS.get(job_id)
+        if old and not old.done():
+            old.cancel()
+        _HITL_WATCHERS[job_id] = asyncio.create_task(
+            _watch_output_waiting_and_resume(job_id, callback.message.chat.id, bot)
+        )
+
         await bot.send_message(
             chat_id=callback.message.chat.id,
             text=(
                 "⏳ <b>Waiting for manual Kling output</b>\n\n"
                 f"Job: <code>{job_id}</code>\n"
-                "Please upload the generated video file (or paste URL) now.\n"
-                "Once received, I will run <b>assembly_manager</b> and continue the pipeline."
+                f"Output-waiting folder: <code>{output_waiting_dir or ('data/jobs/' + job_id + '/output_waiting')}</code>\n"
+                "You can: upload video here, paste URL, or drop file into output-waiting folder.\n"
+                "Once detected, I will run <b>assembly_manager</b> automatically."
             ),
         )
         await callback.answer()
@@ -662,6 +717,10 @@ async def hitl_media_received_handler(message: Message, state: FSMContext, bot: 
         await message.answer(f"Failed to download upload: {e}")
         return
 
+    watcher = _HITL_WATCHERS.get(job_id)
+    if watcher and not watcher.done():
+        watcher.cancel()
+
     status_msg = await message.answer("📥 Upload received. Resuming assembly pipeline...")
     video_path = await resume_pipeline_with_human_output(
         job_id=job_id,
@@ -691,6 +750,10 @@ async def hitl_url_received_handler(message: Message, state: FSMContext) -> None
         await message.answer("Missing job context. Please restart /generator.")
         await state.clear()
         return
+
+    watcher = _HITL_WATCHERS.get(job_id)
+    if watcher and not watcher.done():
+        watcher.cancel()
 
     status_msg = await message.answer("🔗 URL received. Resuming assembly pipeline...")
     await resume_pipeline_with_human_output(
@@ -726,6 +789,13 @@ async def generate_cancel_handler(
     state: FSMContext,
 ) -> None:
     """Cancel the generation wizard at any step."""
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    if isinstance(job_id, str):
+        watcher = _HITL_WATCHERS.get(job_id)
+        if watcher and not watcher.done():
+            watcher.cancel()
+
     await state.clear()
     await callback.message.edit_text("Video generation wizard cancelled.")
     await callback.answer()
