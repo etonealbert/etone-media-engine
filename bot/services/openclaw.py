@@ -291,6 +291,7 @@ async def _run_openclaw_agent(
     for path in [
         ("result", "output"),
         ("result", "message"),
+        ("result", "payloads"),
         ("output",),
         ("message",),
         ("text",),
@@ -305,6 +306,10 @@ async def _run_openclaw_agent(
                 break
         if ok and isinstance(cur, str) and cur.strip():
             return cur
+        if ok and isinstance(cur, list) and cur and isinstance(cur[0], dict):
+            payload_text = cur[0].get("text")
+            if isinstance(payload_text, str) and payload_text.strip():
+                return payload_text
 
     return out
 
@@ -1045,6 +1050,13 @@ async def resume_pipeline_with_human_output(
             candidate = settings.base_dir / candidate
         if candidate.exists():
             video_path = candidate
+
+    if video_path is None and isinstance(human_video_path, str) and human_video_path.strip():
+        hv = Path(human_video_path.strip())
+        if not hv.is_absolute():
+            hv = settings.base_dir / hv
+        if hv.exists():
+            video_path = hv
 
     if video_path is None:
         video_path = await get_latest_video()
