@@ -96,10 +96,68 @@ def _trace_stage_end(trace_path: Path, stage: str, status: str, error: str | Non
     _safe_write_json(trace_path, trace)
 
 
-def _write_stage_logs(stage_logs_dir: Path, stage: str, raw_text: str, parsed: dict[str, Any] | None) -> None:
+def _write_stage_logs(
+    stage_logs_dir: Path, stage: str, raw_text: str, parsed: dict[str, Any] | None
+) -> None:
     _safe_write_text(stage_logs_dir / f"{stage}.raw.txt", raw_text)
     if parsed is not None:
         _safe_write_json(stage_logs_dir / f"{stage}.parsed.json", parsed)
+
+
+# Forbidden service/agency language patterns (case-insensitive).
+# These indicate agent drift toward promoting a UGC agency/service
+# instead of the selected consumer product.
+_FORBIDDEN_SERVICE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bstudio\b",
+        r"\bwe build creatives\b",
+        r"\b(?:CTR|CPA)\b",
+        r"\bvariants?\b",
+        r"\bcampaign services?\b",
+        r"\bagency\b",
+        r"\bwe (?:build|create|deliver|offer|provide)\b",
+        r"\bour (?:team|service|platform)\b",
+        r"\bcreative services?\b",
+    ]
+]
+
+
+def _validate_stage_output(stage: str, parsed: dict[str, Any]) -> None:
+    """Check stage output for forbidden service/agency language.
+
+    Raises ValueError if forbidden terms are found, so the pipeline
+    records the failure in trace and stops before the next stage.
+    """
+    texts_to_check: list[tuple[str, str]] = []  # (field_label, value)
+
+    if stage == "analyst":
+        pn = parsed.get("product_name")
+        if isinstance(pn, str):
+            texts_to_check.append(("analyst.product_name", pn))
+    elif stage == "scriptwriter":
+        title = parsed.get("title")
+        if isinstance(title, str):
+            texts_to_check.append(("scriptwriter.title", title))
+        for seg in parsed.get("segments", []):
+            if isinstance(seg, dict):
+                st = seg.get("spoken_text")
+                sid = seg.get("segment_id", "?")
+                if isinstance(st, str):
+                    texts_to_check.append((f"scriptwriter.segment[{sid}].spoken_text", st))
+
+    violations: list[str] = []
+    for label, text in texts_to_check:
+        for pat in _FORBIDDEN_SERVICE_PATTERNS:
+            match = pat.search(text)
+            if match:
+                violations.append(f"{label}: matched '{match.group()}' (pattern: {pat.pattern})")
+
+    if violations:
+        detail = "; ".join(violations)
+        raise ValueError(
+            f"Agent drift detected in {stage} output — forbidden service/agency language found: {detail}"
+        )
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any]:
@@ -267,15 +325,48 @@ def _stage_prompt(stage: str, job_path: Path, in_path: Path | None, out_path: Pa
     if in_path:
         base.insert(1, f"Read previous stage output at: {in_path}")
 
+    # Optional scriptwriter research context for hooks/retention style
+    if stage == "scriptwriter":
+        _research_paths = [
+            Path("/home/etonealbert/.openclaw/subagents/Short-Form Content Strategy Framework.txt"),
+            settings.base_dir / "docs" / "context" / "short_form_content_strategy_framework.txt",
+        ]
+        for rp in _research_paths:
+            if rp.exists():
+                base.insert(
+                    1,
+                    f"Read research context for hooks/retention style at: {rp}\n"
+                    "Use its techniques while keeping ALL content strictly about the consumer product.",
+                )
+                break
+
     if stage == "analyst":
         spec = (
-            "You are analyst. Produce JSON with keys: product_name,target_audience,pain_points,key_hooks,"
-            "competitive_angle,cta_suggestion. pain_points 3-5 items."
+            "You are analyst. Your ONLY job is to analyze the CONSUMER PRODUCT selected by the user "
+            "and produce a consumer-facing ad brief for a short-form UGC video ad.\n"
+            "Produce JSON with keys: product_name,target_audience,pain_points,key_hooks,"
+            "competitive_angle,cta_suggestion. pain_points 3-5 items.\n"
+            "CRITICAL CONSTRAINTS:\n"
+            "- product_name MUST be the actual consumer product name from the job payload, never an agency or service name.\n"
+            "- ALL output must be consumer-facing ad copy perspective (viewer = potential buyer).\n"
+            "- NEVER use agency/service language: 'studio', 'we build creatives', 'CTR', 'CPA', "
+            "'variants', 'campaign services', 'agency', 'our team', 'creative services'.\n"
+            "- You are writing about a PRODUCT the viewer might buy, not a service a brand might hire."
         )
     elif stage == "scriptwriter":
         spec = (
-            "You are scriptwriter. Produce timed UGC JSON with keys: title,total_duration_seconds,segments,"
-            "voiceover_instructions. Each segment <=15 seconds and has segment_id,duration_seconds,spoken_text,visual_direction,emotion."
+            "You are scriptwriter. Your ONLY job is to write a short-form UGC video script that "
+            "advertises the CONSUMER PRODUCT from the analyst output to end consumers.\n"
+            "Produce timed UGC JSON with keys: title,total_duration_seconds,segments,"
+            "voiceover_instructions. Each segment <=15 seconds and has segment_id,duration_seconds,"
+            "spoken_text,visual_direction,emotion.\n"
+            "CRITICAL CONSTRAINTS:\n"
+            "- The script is a consumer-facing product ad (TikTok/Reels/Shorts style).\n"
+            "- spoken_text must sound like a real person recommending the PRODUCT to viewers.\n"
+            "- title must reference the product, never an agency or service.\n"
+            "- NEVER use agency/service language: 'studio', 'we build creatives', 'CTR', 'CPA', "
+            "'variants', 'campaign services', 'agency', 'our team', 'creative services'.\n"
+            "- You are writing ad copy for consumers, NOT a pitch deck for brand clients."
         )
     elif stage == "prompt_engineer":
         spec = (
@@ -698,6 +789,7 @@ async def run_openclaw_agents(
         analyst_json = _extract_first_json_object(analyst_raw)
         _safe_write_json(analyst_path, analyst_json)
         _write_stage_logs(stage_logs_dir, "analyst", analyst_raw, analyst_json)
+        _validate_stage_output("analyst", analyst_json)
         _trace_stage_end(trace_path, current_stage, "done")
         _set_pipeline_status(payload, "analyst", "done")
 
@@ -714,6 +806,7 @@ async def run_openclaw_agents(
         script_json = _extract_first_json_object(script_raw)
         _safe_write_json(script_path, script_json)
         _write_stage_logs(stage_logs_dir, "scriptwriter", script_raw, script_json)
+        _validate_stage_output("scriptwriter", script_json)
         _trace_stage_end(trace_path, current_stage, "done")
         _set_pipeline_status(payload, "scriptwriter", "done")
 
